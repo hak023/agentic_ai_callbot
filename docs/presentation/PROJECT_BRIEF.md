@@ -117,7 +117,7 @@ Agentic AI Callbot은 표준 SIP 기반 통화 제어 위에 실시간 음성 AI
 #### 상세 기능
 
 - **자연어 응대** — 한 문장에 날짜·시간·인원·요청을 동시에 담아도 인식합니다.
-- **Barge-in (바지인)** — VAD가 사용자 발화를 감지하는 즉시 `StartInterruptionFrame`으로 TTS를 끊고 새 의도를 처리합니다.
+- **스마트 바지인 (Smart Barge-in)** — 단순 VAD 감지로 TTS를 즉시 끊지 않고, STT로 인식된 텍스트의 단어 수와 키워드를 평가하여 단순 맞장구("네", "아하")와 실제 끼어들기를 구분한 뒤 유효한 질문일 때만 TTS를 중단시킵니다.
 - **Streaming TTS** — LLM 첫 문장이 완성되는 즉시 합성·송출이 시작됩니다.
 - **STT Debounce** — 짧은 침묵으로 끊긴 발화를 1.2초 윈도로 합쳐서 한 발화로 처리합니다.
 - **STT Supersede** — 동일 통화에서 새 발화가 도착하면 진행 중이던 LLM 작업을 취소하고 병합 재처리합니다.
@@ -140,7 +140,7 @@ Agentic AI Callbot은 표준 SIP 기반 통화 제어 위에 실시간 음성 AI
   - **결과** — AI가 "내일 저녁 7시 4인 창가 자리 가능합니다. 예약해 드릴까요?" 한 번에 응답합니다.
 - **US-1.2 (말 끊고 다른 질문)**
   - **상황** — AI가 영업시간을 안내하는 도중 고객이 "잠깐, 주차는 돼요?" 라고 끼어듭니다.
-  - **시스템 처리** — VAD가 끼어들기를 감지하고 `StartInterruptionFrame`이 TTS를 즉시 중단시킵니다.
+  - **시스템 처리** — 스마트 바지인이 단순 추임새가 아닌 실제 질문("잠깐, 주차는...")임을 판정하여 TTS를 중단시킵니다.
   - **결과** — 영업시간 설명을 멈추고 "지하 주차장 무료로 이용 가능합니다." 로 자연스럽게 전환됩니다.
 - **US-1.3 (어색한 침묵 제거)**
   - **상황** — 고객이 전화 직후 침묵을 우려합니다.
@@ -667,7 +667,7 @@ AICC 엔지니어링팀의 "Voice Agent Platform" 구축 방향과 본 **Agentic
 | 구분 | AICC 엔지니어링팀 Voice Agent | Agentic AI Callbot (본 시스템) |
 |---|---|---|
 | **E2E 스트리밍 파이프라인** | STT → LLM → TTS 전 구간 병렬 스트리밍으로 E2E 지연 < 800ms 확보 목표 | Pipecat 프레임워크 기반 VAD → STT → LLM → 스트리밍 TTS 구조 적용 완료 (빠른 응답 속도 확보) |
-| **자연스러운 대화 (Turn-taking)** | Endpointing, Turn-taking, Barge-in 처리를 통한 자연스러운 대화 전환 및 끼어들기 감지 | VAD 기반 Barge-in(바지인) 구현으로 AI 발화 중 고객이 말하면 즉시 중단(StartInterruptionFrame) 및 새 의도 처리 |
+| **자연스러운 대화 (Turn-taking)** | Endpointing, Turn-taking, Barge-in 처리를 통한 자연스러운 대화 전환 및 끼어들기 감지 | 단순 VAD 기반이 아닌 **스마트 바지인(Smart Barge-in)** 구현으로 단순 맞장구와 실제 끼어들기를 구분하여 자연스러운 턴 전환 지원 |
 | **LLM 기반 동적 대화** | 사전 정의 시나리오(룰/인텐트) 한계 극복, 멀티턴 컨텍스트 관리 및 상담사 Handoff | LangGraph 기반 17개 의도 동적 라우팅, RAG 결합 응답, 신뢰도 부족 시 HITL(운영자 개입) 및 상담사 호 전환(Transfer) 지원 |
 | **업무 시스템 연계 (Tool-Calling)** | Tool-calling을 통한 CRM·기간계 연계 | LLM의 Tool Use Loop를 활용한 예약 슬롯 조회, 확정, 변경 및 Google Calendar 동기화 |
 | **운영 안정성 및 거버넌스** | Human-in-the-Loop(HITL) 승인 도입 (CUA 영역) | 통화 중 AI 자신감(Confidence) 저하 시 즉각적인 HITL 알림 및 운영자 직접 개입/정제 후 음성 송출 지원 |
