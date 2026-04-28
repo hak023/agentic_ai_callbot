@@ -642,81 +642,7 @@ sequenceDiagram
 
 ---
 
-### 4.5 착신 제어 (Call Control) — 시간·상황별 응답 정책
-
-**무엇을 해결하는가**: 같은 대표번호라도 평일 낮·야간·휴일·VIP·블랙리스트에 따라 다른 응답이 필요합니다.
-
-#### 아키텍처
-
-```mermaid
-flowchart LR
-    INVITE["SIP INVITE"] --> RE["Routing Engine"]
-    RE --> CF["caller_filter\n(VIP / Block / 패턴 매치)"]
-    CF -->|매칭| Force["Forced Action"]
-    CF -->|미매칭| Sch["call_schedules\n(요일·시간대·공휴일)"]
-    Sch --> Rule["call_routing_rules\n(우선순위 정렬)"]
-    Rule --> Action{"RoutingAction"}
-    Action --> Direct["direct (담당자 직접)"]
-    Action --> NoAns["no_answer_ai (N초 무응답 후 AI)"]
-    Action --> Imm["immediate_ai (즉시 AI)"]
-    Action --> Fwd["forward (지정 번호)"]
-    Action --> RG["ring_group (순차 / 동시 링)"]
-    Rule --> Anno["announcement_profiles\n(인사말 오버라이드)"]
-    Action --> Pipe["Pipecat / RTP 처리"]
-    Pipe --> OS["폴백: operator_status (away mode)"]
-```
-
-#### 동작 FLOW
-
-```mermaid
-sequenceDiagram
-    participant SIP as SIP B2BUA
-    participant RE as Routing Engine
-    participant DB as call_control DB
-    participant AI as AI Pipeline
-    SIP->>RE: INVITE (caller, callee, 시각)
-    RE->>DB: caller_filter 평가
-    alt VIP/Block 매칭
-        RE-->>SIP: 강제 액션 적용
-    else 매칭 없음
-        RE->>DB: schedule + rule 평가
-        DB-->>RE: matched RoutingRule (action, announcement_id, forward_to)
-        opt announcement_id 존재
-            RE->>AI: greeting_override = announcement.text
-        end
-        RE-->>SIP: action 적용 (direct/no_answer_ai/immediate_ai/forward/ring_group)
-    end
-```
-
-#### 상세 기능
-
-- **DB 스키마** — `call_routing_rules / call_schedules / announcement_profiles / call_ring_groups / call_caller_filters / call_overflow_policies` (별도 `data/call_control.db`).
-- **5가지 라우팅 액션** — `direct / no_answer_ai / immediate_ai / forward / ring_group`.
-- **공휴일 자동 인식** — `holidays` 패키지(선택 의존성). 미설치 시 공휴일 조건만 비활성, 나머지 정상.
-- **발신자 필터** — VIP·차단·번호 패턴별 강제 액션. 일반 정책보다 우선 평가.
-- **안내 멘트 오버라이드** — `announcement_id` 매칭 시 Pipecat `pipeline_builder.send_greeting`에 `greeting_override` 텍스트 주입.
-- **폴백 호환성** — Call Control 규칙이 없으면 기존 `operator_status`(자리비움 모드)로 폴백.
-- **헤더 상태 배지** — 콘솔 헤더에 현재 적용 정책 이름을 읽기 전용 배지로 표시.
-- **Immediate AI 200 OK ACK Takeover** — `immediate_ai` 정책 시 벨소리 없이 즉시 200 OK 응답 후 AI Pipeline 인수.
-
-#### 사용자 스토리
-
-- **US-5.1 (점심 피크에 사람 대신 AI 인수)**
-  - **상황** — 점심 시간에 점장이 손님을 받느라 전화를 받지 못합니다.
-  - **시스템 처리** — `no_answer_ai` 규칙이 10초 무응답을 감지하고 AI Pipeline을 인수합니다.
-  - **결과** — 고객은 끊지 않고 AI에게 예약·문의를 그대로 진행합니다.
-- **US-5.2 (야간·휴일 자동 안내)**
-  - **상황** — 토요일 밤 11시에 환자가 전화합니다.
-  - **시스템 처리** — 야간/공휴일 스케줄 + `immediate_ai` 액션 + 휴일 전용 `announcement_profile`.
-  - **결과** — 첫 응답부터 AI가 받고 휴일 안내 멘트로 시작합니다.
-- **US-5.3 (VIP 발신자 우선 처리)**
-  - **상황** — VIP 거래처가 야간에 대표번호로 전화합니다.
-  - **시스템 처리** — `caller_filter` 가 일반 스케줄보다 먼저 평가되어 강제 액션이 적용됩니다.
-  - **결과** — 야간이라도 지정된 담당자 휴대폰으로 즉시 연결됩니다.
-
----
-
-### 4.6 통화 연결음 — 대기 시간을 브랜드 경험으로
+### 4.5 통화 연결음 — 대기 시간을 브랜드 경험으로
 
 **무엇을 해결하는가**: 전화 연결 전 침묵을 없애고, 그 짧은 시간을 브랜드 안내·음악으로 활용합니다.
 
@@ -768,22 +694,22 @@ sequenceDiagram
 
 #### 사용자 스토리
 
-- **US-6.1 (첫 인상 강화)**
+- **US-5.1 (첫 인상 강화)**
   - **상황** — 고객이 매장에 처음 전화를 겁니다.
   - **시스템 처리** — INVITE 직후 Early Bind 후 `RingbackPlayer`가 시작되어 인사 TTS + 음원이 RTP로 송출됩니다.
   - **결과** — 사람이 받기 전 침묵이 사라지고 매장 분위기를 첫 통화부터 경험합니다.
-- **US-6.2 (운영자가 직접 만드는 매장 음원)**
+- **US-5.2 (운영자가 직접 만드는 매장 음원)**
   - **상황** — 운영자가 "여름 한정 메뉴 안내곡" 을 콘솔에서 만들고 싶어 합니다.
   - **시스템 처리** — Suno API로 가사/스타일/BPM을 입력해 후보 2곡을 생성하고 미리듣기 후 적용합니다.
   - **결과** — 클릭 한 번으로 음원이 교체됩니다.
-- **US-6.3 (자연스러운 정지)**
+- **US-5.3 (자연스러운 정지)**
   - **상황** — 음원이 흐르는 도중 점장이 통화를 받습니다.
   - **시스템 처리** — 200 OK 응답 시 `_stop_ringback_player()`가 RTP 송출을 부드럽게 끊습니다.
   - **결과** — 음원과 사람 목소리가 겹치지 않고 깔끔하게 인사로 이어집니다.
 
 ---
 
-### 4.7 문자 (SMS · SIP MESSAGE) 응대 — 같은 AI, 다른 채널
+### 4.6 문자 (SMS · SIP MESSAGE) 응대 — 같은 AI, 다른 채널
 
 **무엇을 해결하는가**: 전화가 부담스러운 고객도 같은 품질로 응대받을 수 있게 합니다.
 
@@ -835,91 +761,22 @@ sequenceDiagram
 
 #### 사용자 스토리
 
-- **US-7.1 (전화 대신 문자로 문의)**
+- **US-6.1 (전화 대신 문자로 문의)**
   - **상황** — 회의 중인 고객이 통화 대신 "오늘 영업해요?" 라고 문자를 보냅니다.
   - **시스템 처리** — 같은 LangGraph 두뇌가 question 으로 분류 → KB 검색 → SIP MESSAGE 응답.
   - **결과** — "오늘은 오후 9시까지 영업합니다" 라는 문자 회신이 즉시 도착합니다.
-- **US-7.2 (예약 확정 문자 자동 발송)**
+- **US-6.2 (예약 확정 문자 자동 발송)**
   - **상황** — 통화로 예약이 막 확정됩니다.
   - **시스템 처리** — `booking_notify_service` 가 idempotency 테이블을 확인 후 SIP MESSAGE 발송.
   - **결과** — 고객이 캡처해 일정에 보관할 수 있고 노쇼 위험이 줄어듭니다.
-- **US-7.3 (통화 종료 후 요약 문자)**
+- **US-6.3 (통화 종료 후 요약 문자)**
   - **상황** — 고객이 여러 안내를 듣고 통화를 마칩니다.
   - **시스템 처리** — 종료 직후 LLM이 대화 핵심을 300자로 요약해 발송.
   - **결과** — 고객이 들었던 내용을 잊지 않고 재확인할 수 있습니다.
 
 ---
 
-### 4.8 발신 연락처 (CID) · 통화 도크 — 전화 받자마자 보이는 고객 카드
-
-**무엇을 해결하는가**: 전화가 오는 순간 누가, 몇 번째 전화인지, 무슨 맥락인지 즉시 파악합니다.
-
-#### 아키텍처
-
-```mermaid
-flowchart LR
-    INVITE["INVITE 수신"] --> Needle["caller_match_needle\n(canonical phone + 끝 4자리)"]
-    Needle --> Ctx["GET /api/calls/caller-context\n(연락처 + 30d/누적 통계)"]
-    Ctx --> Dock["GlobalCallDock (이중 라인 표시)"]
-    EndCall["통화 종료"] --> AutoFill["caller_contact_autofill\n(예약명 우선 → LLM JSON 추출)"]
-    AutoFill --> CCDB[("caller_contacts\ndisplay_name + tail4")]
-    CCDB --> Tree["Contact Folder Tree (DnD)"]
-```
-
-#### 동작 FLOW
-
-```mermaid
-sequenceDiagram
-    participant SIP as SIP Endpoint
-    participant API as call_history API
-    participant Dock as GlobalCallDock
-    participant End as End-of-Call Hook
-    participant LLM as LLM
-    SIP->>API: caller-context (caller, owner)
-    API->>API: caller_match_needle 정규화
-    API->>API: count_inbound_calls_for_caller (30d / all, 현재 통화 제외)
-    API-->>Dock: name + tail4 + counts
-    Dock-->>Operator: "홍길동·5678 / 30일 5회 누적 47회"
-    SIP->>End: BYE
-    End->>End: bookings.customer_name 우선 조회
-    alt 예약명 있음
-        End->>CCDB: upsert (source=auto_booking_hint)
-    else 없음
-        End->>LLM: transcript 발췌 → JSON 이름 추출
-        LLM-->>End: {"name": "..."}
-        End->>CCDB: upsert (source=auto_llm)
-    end
-```
-
-#### 상세 기능
-
-- **이중 라인 도크** — 1행 발신 식별(전화번호), 2행 표시명("이름_끝4자리").
-- **재인입 통계** — 최근 30일·누적 인입 횟수(현재 통화 제외) 표시로 단골/반복 문의 즉시 인지.
-- **자동 표시명 등록** — 통화 종료 시 ① `bookings.customer_name`(`auto_booking_hint`) 우선 → ② transcript 기반 LLM JSON 추출(`auto_llm`).
-- **수동 우선** — `source=manual` 인 항목은 자동 갱신을 건너뜁니다.
-- **`caller_match_needle`** — 한국 휴대폰·국번 패턴 정규화로 다양한 표기 통일.
-- **연락처 폴더 트리** — `contact_folders` 테이블 + `caller_contacts.folder_id`. `@dnd-kit` 기반 끌어다 놓기, 폴더 삭제 시 하위 폴더·연락처 승격.
-- **연락처 CRUD** — `GET/POST/PATCH/DELETE /api/caller-contacts`. PATCH 시 중복 `canonical_phone` 409.
-- **CID 도크 항상 가시화** — 컨택트 도크와 활성 통화 도크가 사이드 탭 형태로 항상 노출되어 화면 전환 없이 운영합니다.
-
-#### 사용자 스토리
-
-- **US-8.1 (단골 식별)**
-  - **상황** — 단골 고객이 평소처럼 전화를 겁니다.
-  - **시스템 처리** — `caller-context` 응답에 30일 5회·누적 47회가 포함되고 도크에 즉시 표시.
-  - **결과** — 운영자는 "홍길동님 안녕하세요" 부터 응대를 시작합니다.
-- **US-8.2 (신규 고객 자동 등록)**
-  - **상황** — 처음 보는 번호에서 통화가 들어와 예약이 확정됩니다.
-  - **시스템 처리** — End-of-Call 훅이 `customer_name` 또는 LLM 추출 이름으로 `caller_contacts` 를 upsert.
-  - **결과** — 다음 통화부터 도크에 자동으로 이름이 표시됩니다.
-- **US-8.3 (폴더로 연락처 정리)**
-  - **상황** — 운영자가 단골/VIP/블랙리스트 그룹을 구분 관리하고 싶어 합니다.
-  - **시스템 처리** — `contact_folders` 트리에서 끌어다 놓기로 `folder_id` 만 변경(소스는 보존).
-  - **결과** — 그룹 전환이 즉시 반영되고 정책 연결도 손쉬워집니다.
-
----
-
-### 4.9 호 전환 (Call Transfer) — 끊김 없는 사람 연결
+### 4.7 호 전환 (Call Transfer) — 끊김 없는 사람 연결
 
 **무엇을 해결하는가**: AI가 답할 수 없는 상황, 고객이 직접 사람을 찾는 상황에서도 통화가 끊기지 않도록 합니다.
 
@@ -978,22 +835,22 @@ sequenceDiagram
 
 #### 사용자 스토리
 
-- **US-9.1 (부서 자동 연결)**
+- **US-7.1 (부서 자동 연결)**
   - **상황** — 고객이 "결제 관련해서 담당자 연결해 주세요" 라고 말합니다.
   - **시스템 처리** — `intent=transfer` → category=contact 벡터 검색에서 결제 부서 매칭 → SIP INVITE.
   - **결과** — ARS 메뉴 누르지 않고 한마디로 담당자에게 연결됩니다.
-- **US-9.2 (운영자가 직접 통화 인수)**
+- **US-7.2 (운영자가 직접 통화 인수)**
   - **상황** — 운영자가 모니터링 중 직접 받기로 결정합니다.
   - **시스템 처리** — 콘솔에서 `manual_transfer_request` 클릭 → 자기 내선 INVITE.
   - **결과** — 고객 입장에서 통화가 끊기지 않고 자연스럽게 사람과 이어집니다.
-- **US-9.3 (전환 실패 시 안전 복귀)**
+- **US-7.3 (전환 실패 시 안전 복귀)**
   - **상황** — 담당자가 부재중이라 호 전환이 실패합니다.
   - **시스템 처리** — `FAILED` 상태로 진입 후 AI 모드 자동 복귀.
   - **결과** — 고객이 "지금 자리를 비웠습니다. 메모 남겨 드릴까요?" 같은 후속 안내를 받습니다.
 
 ---
 
-### 4.10 발신 (Outbound) — AI가 먼저 거는 전화
+### 4.8 발신 (Outbound) — AI가 먼저 거는 전화
 
 **무엇을 해결하는가**: 만족도 조사·예약 리마인드·미회신 안내 같은 반복 발신 업무를 자동화합니다.
 
@@ -1044,89 +901,22 @@ sequenceDiagram
 
 #### 사용자 스토리
 
-- **US-10.1 (만족도 조사 자동 캠페인)**
+- **US-8.1 (만족도 조사 자동 캠페인)**
   - **상황** — 매장에서 지난주 방문 고객 100명에게 만족도 조사가 필요합니다.
   - **시스템 처리** — 캠페인 등록 → 시간대를 지키며 자동 발신 → LLM 단일 호출 JSON 응답으로 점수·코멘트 수집.
   - **결과** — 점수와 코멘트가 표 형태로 콘솔에 정리되고, 부재중은 재시도 큐에 적재됩니다.
-- **US-10.2 (예약 리마인드 발신)**
+- **US-8.2 (예약 리마인드 발신)**
   - **상황** — 내일 예약된 고객에게 잊지 않도록 안내가 필요합니다.
   - **시스템 처리** — 예약 24시간 전 자동 발신 + 변경/취소 의사 확인.
   - **결과** — 노쇼가 줄고 고객의 변경 의사가 즉시 캘린더·SMS로 반영됩니다.
-- **US-10.3 (잡담·거절에도 자연스러운 회복)**
+- **US-8.3 (잡담·거절에도 자연스러운 회복)**
   - **상황** — 고객이 조사 도중 "지금 바빠요" 라고 합니다.
   - **시스템 처리** — `is_answer=false` 분기에서 LLM이 양해 멘트 생성 + 콜백 정보 적재.
   - **결과** — 무리하게 진행하지 않고 다음 기회를 만듭니다.
 
 ---
 
-### 4.11 운영자 콘솔 — 한 화면에서 보는 운영 도구
-
-**무엇을 해결하는가**: 통화·예약·문자·지식·정책·연락처를 따로따로 보지 않고 한 화면에서 운영합니다.
-
-#### 아키텍처
-
-```mermaid
-flowchart LR
-    SIP["SIP B2BUA"] --> WS["Socket.IO :8001\nhitl_request · call_update\noperator_message · chat_message"]
-    Pipe["Pipecat / LangGraph"] --> WS
-    DB[("ChromaDB · SQLite")] --> REST["FastAPI :8000\n/api/knowledge · /api/persona\n/api/calls · /api/hitl\n/api/booking · /api/call-control\n/api/ringback · /api/chat\n/api/caller-contacts · /api/contact-folders\n/api/google/calendar · /api/outbound"]
-    WS --> UI["Next.js 14 콘솔 :3000"]
-    REST --> UI
-    UI --> Pages["대시보드 / 통화이력 / HITL\n지식·페르소나 / 예약·도메인\n착신 제어 / 연결음 / 채팅\n연락처 트리 / 발신 캠페인"]
-```
-
-#### 동작 FLOW — 실시간 통화 모니터링
-
-```mermaid
-sequenceDiagram
-    participant SIP as SIP B2BUA
-    participant Pipe as Pipecat
-    participant WS as Socket.IO
-    participant UI as 콘솔
-    participant Op as 운영자
-    SIP->>WS: call_started (call_id, caller, callee)
-    UI-->>Op: 활성 통화 카드 표시
-    Pipe->>WS: stt_interim / stt_final / llm_done / tts_complete
-    UI-->>Op: 실시간 STT/TTS 피드 + 처리 단계
-    Pipe->>WS: hitl_request (confidence < 0.3)
-    UI-->>Op: HITL 패널 알림
-    Op->>WS: operator_message (텍스트)
-    WS->>Pipe: 정제 → TTS → KB 저장
-    SIP->>WS: call_ended → 통화 이력 보드 갱신
-```
-
-#### 상세 기능
-
-- **실시간 통화 모니터링** — 진행 중인 통화의 STT/TTS 피드, CDR 단계 추적(rag/llm/tts), confidence를 실시간 표시.
-- **HITL 응답 패널** — `hitl_request` 큐를 카드로 표시, 텍스트 입력 후 즉시 정제·송출.
-- **지식베이스 / 페르소나 관리** — 항목 CRUD, 카테고리 지정, 인사말·어투·`scope_keywords`·`chitchat_response_template`·`escalation_mode` 설정.
-- **예약 / 슬롯 / 도메인 관리** — `/booking`·`/booking/slots`·`/booking/domains`, 상태별 필터, 도메인별 필수/선택 필드 정의.
-- **착신 제어 (Call Control)** — `/settings/call-control` 에서 라우팅 규칙·스케줄·안내 멘트·발신자 필터·착신 그룹 관리. 헤더에 현재 정책 배지.
-- **통화 연결음** — `/settings/ringback` 에서 인사말·음원 생성·미리듣기·적용.
-- **채팅 관리** — `/chat` 페이지의 대화방·실패 재전송·통화 종료 SMS 자동 미리보기.
-- **연락처 트리** — `/contacts` 와 `GlobalContactsDock` 의 폴더 DnD UI.
-- **통화 이력 / 미해결 보드** — `unresolved` 토글, `noted` 메모 필터, transcripts/녹음 재생.
-- **Google Calendar 연동 화면** — `/settings/integrations` 에서 OAuth 시작/해제/일괄 동기화.
-- **발신 캠페인** — 미션·질문·재시도 정책 등록, 진행률 모니터링.
-
-#### 사용자 스토리
-
-- **US-11.1 (실시간 모니터링과 즉시 개입)**
-  - **상황** — 운영자가 모니터링 중 진행 통화가 어색하게 흘러갑니다.
-  - **시스템 처리** — STT/TTS 피드와 confidence를 실시간 보고, `manual_transfer_request` 클릭 한 번으로 통화를 인수.
-  - **결과** — 문제가 커지기 전에 사람이 자연스럽게 개입합니다.
-- **US-11.2 (미해결 통화 후속 처리)**
-  - **상황** — 야간 통화 중 운영자 확인이 필요한 건이 모입니다.
-  - **시스템 처리** — `hitl_status=unresolved` 보드에 자동 분류.
-  - **결과** — 다음 날 아침 보드 하나만 보고 우선순위대로 콜백/문자 회신.
-- **US-11.3 (정책을 코드 수정 없이 변경)**
-  - **상황** — 점심 정책을 다음 주부터 바꿉니다.
-  - **시스템 처리** — `/settings/call-control` 에서 시간대·동작을 수정 후 저장.
-  - **결과** — 개발자 호출 없이 다음 통화부터 새 정책 적용.
-
----
-
-### 4.12 멀티테넌트 — 한 플랫폼 위 여러 조직의 "나만의 AI"
+### 4.9 멀티테넌트 — 한 플랫폼 위 여러 조직의 "나만의 AI"
 
 **무엇을 해결하는가**: 같은 인프라 위에서 여러 고객사·매장·지점이 각자의 AI를 운영합니다.
 
@@ -1171,15 +961,15 @@ sequenceDiagram
 
 #### 사용자 스토리
 
-- **US-12.1 (한 플랫폼, 여러 매장 운영)**
+- **US-9.1 (한 플랫폼, 여러 매장 운영)**
   - **상황** — 같은 본사가 운영하는 카페와 미용실이 같은 시스템을 사용합니다.
   - **시스템 처리** — owner 단위 격리로 카페 INVITE 는 카페 KB·도메인만, 미용실 INVITE 는 미용실 자원만 사용.
   - **결과** — 두 매장은 완전히 별개 AI처럼 보이고 데이터가 절대 섞이지 않습니다.
-- **US-12.2 (지점별 어투·페르소나 분리)**
+- **US-9.2 (지점별 어투·페르소나 분리)**
   - **상황** — 강남점은 격식 있는 어투, 홍대점은 캐주얼한 어투를 원합니다.
   - **시스템 처리** — 같은 LLM 위에서 페르소나·`scope_keywords`만 달리 설정.
   - **결과** — 같은 브랜드라도 지점 분위기에 맞는 응대가 자동으로 이루어집니다.
-- **US-12.3 (가맹점 신규 추가)**
+- **US-9.3 (가맹점 신규 추가)**
   - **상황** — 새 가맹점이 오픈해 즉시 운영을 시작해야 합니다.
   - **시스템 처리** — 신규 owner 등록 → 페르소나·기본 지식·정책만 입력.
   - **결과** — 별도 인프라 구축 없이 새 매장 전용 AI가 즉시 동작합니다.
@@ -1275,3 +1065,214 @@ Agentic AI Callbot은 단순한 콜봇이 아니라,
 ---
 
 *본 문서는 Agentic AI Callbot 시스템의 대외 소개·발표용 Project Brief입니다.*
+
+### 4.10 착신 제어 (Call Control) — 시간·상황별 응답 정책
+
+**무엇을 해결하는가**: 같은 대표번호라도 평일 낮·야간·휴일·VIP·블랙리스트에 따라 다른 응답이 필요합니다.
+
+#### 아키텍처
+
+```mermaid
+flowchart LR
+    INVITE["SIP INVITE"] --> RE["Routing Engine"]
+    RE --> CF["caller_filter\n(VIP / Block / 패턴 매치)"]
+    CF -->|매칭| Force["Forced Action"]
+    CF -->|미매칭| Sch["call_schedules\n(요일·시간대·공휴일)"]
+    Sch --> Rule["call_routing_rules\n(우선순위 정렬)"]
+    Rule --> Action{"RoutingAction"}
+    Action --> Direct["direct (담당자 직접)"]
+    Action --> NoAns["no_answer_ai (N초 무응답 후 AI)"]
+    Action --> Imm["immediate_ai (즉시 AI)"]
+    Action --> Fwd["forward (지정 번호)"]
+    Action --> RG["ring_group (순차 / 동시 링)"]
+    Rule --> Anno["announcement_profiles\n(인사말 오버라이드)"]
+    Action --> Pipe["Pipecat / RTP 처리"]
+    Pipe --> OS["폴백: operator_status (away mode)"]
+```
+
+#### 동작 FLOW
+
+```mermaid
+sequenceDiagram
+    participant SIP as SIP B2BUA
+    participant RE as Routing Engine
+    participant DB as call_control DB
+    participant AI as AI Pipeline
+    SIP->>RE: INVITE (caller, callee, 시각)
+    RE->>DB: caller_filter 평가
+    alt VIP/Block 매칭
+        RE-->>SIP: 강제 액션 적용
+    else 매칭 없음
+        RE->>DB: schedule + rule 평가
+        DB-->>RE: matched RoutingRule (action, announcement_id, forward_to)
+        opt announcement_id 존재
+            RE->>AI: greeting_override = announcement.text
+        end
+        RE-->>SIP: action 적용 (direct/no_answer_ai/immediate_ai/forward/ring_group)
+    end
+```
+
+#### 상세 기능
+
+- **DB 스키마** — `call_routing_rules / call_schedules / announcement_profiles / call_ring_groups / call_caller_filters / call_overflow_policies` (별도 `data/call_control.db`).
+- **5가지 라우팅 액션** — `direct / no_answer_ai / immediate_ai / forward / ring_group`.
+- **공휴일 자동 인식** — `holidays` 패키지(선택 의존성). 미설치 시 공휴일 조건만 비활성, 나머지 정상.
+- **발신자 필터** — VIP·차단·번호 패턴별 강제 액션. 일반 정책보다 우선 평가.
+- **안내 멘트 오버라이드** — `announcement_id` 매칭 시 Pipecat `pipeline_builder.send_greeting`에 `greeting_override` 텍스트 주입.
+- **폴백 호환성** — Call Control 규칙이 없으면 기존 `operator_status`(자리비움 모드)로 폴백.
+- **헤더 상태 배지** — 콘솔 헤더에 현재 적용 정책 이름을 읽기 전용 배지로 표시.
+- **Immediate AI 200 OK ACK Takeover** — `immediate_ai` 정책 시 벨소리 없이 즉시 200 OK 응답 후 AI Pipeline 인수.
+
+#### 사용자 스토리
+
+- **US-10.1 (점심 피크에 사람 대신 AI 인수)**
+  - **상황** — 점심 시간에 점장이 손님을 받느라 전화를 받지 못합니다.
+  - **시스템 처리** — `no_answer_ai` 규칙이 10초 무응답을 감지하고 AI Pipeline을 인수합니다.
+  - **결과** — 고객은 끊지 않고 AI에게 예약·문의를 그대로 진행합니다.
+- **US-10.2 (야간·휴일 자동 안내)**
+  - **상황** — 토요일 밤 11시에 환자가 전화합니다.
+  - **시스템 처리** — 야간/공휴일 스케줄 + `immediate_ai` 액션 + 휴일 전용 `announcement_profile`.
+  - **결과** — 첫 응답부터 AI가 받고 휴일 안내 멘트로 시작합니다.
+- **US-10.3 (VIP 발신자 우선 처리)**
+  - **상황** — VIP 거래처가 야간에 대표번호로 전화합니다.
+  - **시스템 처리** — `caller_filter` 가 일반 스케줄보다 먼저 평가되어 강제 액션이 적용됩니다.
+  - **결과** — 야간이라도 지정된 담당자 휴대폰으로 즉시 연결됩니다.
+
+---
+
+### 4.11 발신 연락처 (CID) · 통화 도크 — 전화 받자마자 보이는 고객 카드
+
+**무엇을 해결하는가**: 전화가 오는 순간 누가, 몇 번째 전화인지, 무슨 맥락인지 즉시 파악합니다.
+
+#### 아키텍처
+
+```mermaid
+flowchart LR
+    INVITE["INVITE 수신"] --> Needle["caller_match_needle\n(canonical phone + 끝 4자리)"]
+    Needle --> Ctx["GET /api/calls/caller-context\n(연락처 + 30d/누적 통계)"]
+    Ctx --> Dock["GlobalCallDock (이중 라인 표시)"]
+    EndCall["통화 종료"] --> AutoFill["caller_contact_autofill\n(예약명 우선 → LLM JSON 추출)"]
+    AutoFill --> CCDB[("caller_contacts\ndisplay_name + tail4")]
+    CCDB --> Tree["Contact Folder Tree (DnD)"]
+```
+
+#### 동작 FLOW
+
+```mermaid
+sequenceDiagram
+    participant Operator as Operator
+    participant SIP as SIP Endpoint
+    participant API as call_history API
+    participant Dock as GlobalCallDock
+    participant End as End-of-Call Hook
+    participant LLM as LLM
+    SIP->>API: caller-context (caller, owner)
+    API->>API: caller_match_needle 정규화
+    API->>API: count_inbound_calls_for_caller (30d / all, 현재 통화 제외)
+    API-->>Dock: name + tail4 + counts
+    Dock-->>Operator: "홍길동·5678 / 30일 5회 누적 47회"
+    SIP->>End: BYE
+    End->>End: bookings.customer_name 우선 조회
+    alt 예약명 있음
+        End->>CCDB: upsert (source=auto_booking_hint)
+    else 없음
+        End->>LLM: transcript 발췌 → JSON 이름 추출
+        LLM-->>End: {"name": "..."}
+        End->>CCDB: upsert (source=auto_llm)
+    end
+```
+
+#### 상세 기능
+
+- **이중 라인 도크** — 1행 발신 식별(전화번호), 2행 표시명("이름_끝4자리").
+- **재인입 통계** — 최근 30일·누적 인입 횟수(현재 통화 제외) 표시로 단골/반복 문의 즉시 인지.
+- **자동 표시명 등록** — 통화 종료 시 ① `bookings.customer_name`(`auto_booking_hint`) 우선 → ② transcript 기반 LLM JSON 추출(`auto_llm`).
+- **수동 우선** — `source=manual` 인 항목은 자동 갱신을 건너뜁니다.
+- **`caller_match_needle`** — 한국 휴대폰·국번 패턴 정규화로 다양한 표기 통일.
+- **연락처 폴더 트리** — `contact_folders` 테이블 + `caller_contacts.folder_id`. `@dnd-kit` 기반 끌어다 놓기, 폴더 삭제 시 하위 폴더·연락처 승격.
+- **연락처 CRUD** — `GET/POST/PATCH/DELETE /api/caller-contacts`. PATCH 시 중복 `canonical_phone` 409.
+- **CID 도크 항상 가시화** — 컨택트 도크와 활성 통화 도크가 사이드 탭 형태로 항상 노출되어 화면 전환 없이 운영합니다.
+
+#### 사용자 스토리
+
+- **US-11.1 (단골 식별)**
+  - **상황** — 단골 고객이 평소처럼 전화를 겁니다.
+  - **시스템 처리** — `caller-context` 응답에 30일 5회·누적 47회가 포함되고 도크에 즉시 표시.
+  - **결과** — 운영자는 "홍길동님 안녕하세요" 부터 응대를 시작합니다.
+- **US-11.2 (신규 고객 자동 등록)**
+  - **상황** — 처음 보는 번호에서 통화가 들어와 예약이 확정됩니다.
+  - **시스템 처리** — End-of-Call 훅이 `customer_name` 또는 LLM 추출 이름으로 `caller_contacts` 를 upsert.
+  - **결과** — 다음 통화부터 도크에 자동으로 이름이 표시됩니다.
+- **US-11.3 (폴더로 연락처 정리)**
+  - **상황** — 운영자가 단골/VIP/블랙리스트 그룹을 구분 관리하고 싶어 합니다.
+  - **시스템 처리** — `contact_folders` 트리에서 끌어다 놓기로 `folder_id` 만 변경(소스는 보존).
+  - **결과** — 그룹 전환이 즉시 반영되고 정책 연결도 손쉬워집니다.
+
+---
+
+### 4.12 운영자 콘솔 — 한 화면에서 보는 운영 도구
+
+**무엇을 해결하는가**: 통화·예약·문자·지식·정책·연락처를 따로따로 보지 않고 한 화면에서 운영합니다.
+
+#### 아키텍처
+
+```mermaid
+flowchart LR
+    SIP["SIP B2BUA"] --> WS["Socket.IO :8001\nhitl_request · call_update\noperator_message · chat_message"]
+    Pipe["Pipecat / LangGraph"] --> WS
+    DB[("ChromaDB · SQLite")] --> REST["FastAPI :8000\n/api/knowledge · /api/persona\n/api/calls · /api/hitl\n/api/booking · /api/call-control\n/api/ringback · /api/chat\n/api/caller-contacts · /api/contact-folders\n/api/google/calendar · /api/outbound"]
+    WS --> UI["Next.js 14 콘솔 :3000"]
+    REST --> UI
+    UI --> Pages["대시보드 / 통화이력 / HITL\n지식·페르소나 / 예약·도메인\n착신 제어 / 연결음 / 채팅\n연락처 트리 / 발신 캠페인"]
+```
+
+#### 동작 FLOW — 실시간 통화 모니터링
+
+```mermaid
+sequenceDiagram
+    participant SIP as SIP B2BUA
+    participant Pipe as Pipecat
+    participant WS as Socket.IO
+    participant UI as 콘솔
+    participant Op as 운영자
+    SIP->>WS: call_started (call_id, caller, callee)
+    UI-->>Op: 활성 통화 카드 표시
+    Pipe->>WS: stt_interim / stt_final / llm_done / tts_complete
+    UI-->>Op: 실시간 STT/TTS 피드 + 처리 단계
+    Pipe->>WS: hitl_request (confidence < 0.3)
+    UI-->>Op: HITL 패널 알림
+    Op->>WS: operator_message (텍스트)
+    WS->>Pipe: 정제 → TTS → KB 저장
+    SIP->>WS: call_ended → 통화 이력 보드 갱신
+```
+
+#### 상세 기능
+
+- **실시간 통화 모니터링** — 진행 중인 통화의 STT/TTS 피드, CDR 단계 추적(rag/llm/tts), confidence를 실시간 표시.
+- **HITL 응답 패널** — `hitl_request` 큐를 카드로 표시, 텍스트 입력 후 즉시 정제·송출.
+- **지식베이스 / 페르소나 관리** — 항목 CRUD, 카테고리 지정, 인사말·어투·`scope_keywords`·`chitchat_response_template`·`escalation_mode` 설정.
+- **예약 / 슬롯 / 도메인 관리** — `/booking`·`/booking/slots`·`/booking/domains`, 상태별 필터, 도메인별 필수/선택 필드 정의.
+- **착신 제어 (Call Control)** — `/settings/call-control` 에서 라우팅 규칙·스케줄·안내 멘트·발신자 필터·착신 그룹 관리. 헤더에 현재 정책 배지.
+- **통화 연결음** — `/settings/ringback` 에서 인사말·음원 생성·미리듣기·적용.
+- **채팅 관리** — `/chat` 페이지의 대화방·실패 재전송·통화 종료 SMS 자동 미리보기.
+- **연락처 트리** — `/contacts` 와 `GlobalContactsDock` 의 폴더 DnD UI.
+- **통화 이력 / 미해결 보드** — `unresolved` 토글, `noted` 메모 필터, transcripts/녹음 재생.
+- **Google Calendar 연동 화면** — `/settings/integrations` 에서 OAuth 시작/해제/일괄 동기화.
+- **발신 캠페인** — 미션·질문·재시도 정책 등록, 진행률 모니터링.
+
+#### 사용자 스토리
+
+- **US-12.1 (실시간 모니터링과 즉시 개입)**
+  - **상황** — 운영자가 모니터링 중 진행 통화가 어색하게 흘러갑니다.
+  - **시스템 처리** — STT/TTS 피드와 confidence를 실시간 보고, `manual_transfer_request` 클릭 한 번으로 통화를 인수.
+  - **결과** — 문제가 커지기 전에 사람이 자연스럽게 개입합니다.
+- **US-12.2 (미해결 통화 후속 처리)**
+  - **상황** — 야간 통화 중 운영자 확인이 필요한 건이 모입니다.
+  - **시스템 처리** — `hitl_status=unresolved` 보드에 자동 분류.
+  - **결과** — 다음 날 아침 보드 하나만 보고 우선순위대로 콜백/문자 회신.
+- **US-12.3 (정책을 코드 수정 없이 변경)**
+  - **상황** — 점심 정책을 다음 주부터 바꿉니다.
+  - **시스템 처리** — `/settings/call-control` 에서 시간대·동작을 수정 후 저장.
+  - **결과** — 개발자 호출 없이 다음 통화부터 새 정책 적용.
+
+---
