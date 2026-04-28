@@ -177,29 +177,7 @@ flowchart TB
 
 ## 3. 솔루션 아키텍처
 
-### 3.1 한눈에 보기
-
-```mermaid
-flowchart TB
-    Phone["고객 전화·문자"] --> Core
-    subgraph Core["Agentic AI Callbot 통합 시스템"]
-        B2BUA["SIP B2BUA\n(통화 신호·미디어 제어)"]
-        Pipe["AI 음성 파이프라인\n(Pipecat + LangGraph)"]
-        Chroma["ChromaDB\n(지식·캐시·페르소나)"]
-        SQLite["SQLite\n(예약·연락처·정책·이력)"]
-        API["FastAPI REST :8000\n+ Socket.IO :8001"]
-        UI["운영자 콘솔\n(Next.js 14) :3000"]
-        B2BUA <--> Pipe
-        Pipe <--> Chroma
-        Pipe <--> SQLite
-        B2BUA --> API
-        Pipe --> API
-        API --> UI
-    end
-    Core <--> Ext["외부 서비스\nGoogle STT/TTS/Gemini\nGoogle Calendar / Suno"]
-```
-
-### 3.2 6레이어 아키텍처
+### 3.1 전체 아키텍처 (6 레이어)
 
 시스템은 책임이 분리된 6개 레이어 + 외부 AI 서비스 클러스터로 구성됩니다.
 
@@ -281,7 +259,7 @@ flowchart TB
 
 **임베딩**: `all-MiniLM-L6-v2` (384차원), 코사인 유사도, `where={owner}` 테넌트 필터.
 
-### 3.3 통화 한 건의 여정 (End-to-End)
+### 3.2 통화 한 건의 여정 (End-to-End)
 
 ```mermaid
 flowchart TD
@@ -299,7 +277,7 @@ flowchart TD
     G --> I["⑨ 종료 후 요약 SMS / 예약 확인 SMS / Google Calendar 동기화"]
 ```
 
-### 3.4 LangGraph 의도 라우팅 구조
+### 3.3 LangGraph 의도 라우팅 구조
 
 17개 의도를 6 레인으로 라우팅합니다.
 
@@ -308,12 +286,12 @@ flowchart TD
     In["사용자 발화"] --> CI["classify_intent\n키워드 → 규칙 → 페르소나 유사도 → LLM 병합"]
     CI --> RU["route_utterance"]
 
-    RU -->|소셜 / chitchat / out_of_scope| GS["generate_response\n(RAG 스킵)"]
-    RU -->|greeting / farewell| GFB["greeting_farewell_kb\n(ChromaDB 직접 조회 ~0.01s)"]
-    RU -->|템플릿 (affirm/deny/repeat/clarification 등)| TMPL["template_response\n(LLM 0회)"]
-    RU -->|booking| BOOK["booking_agent\n(LLM + Tool Use Loop)"]
-    RU -->|transfer| TRF["transfer_handler\n(Contact KB → SIP REFER)"]
-    RU -->|knowledge (question/complaint/help)| CC["check_cache\n(qa_cache 시맨틱 검색)"]
+    RU -- "소셜 / chitchat / out_of_scope" --> GS["generate_response\n(RAG 스킵)"]
+    RU -- "greeting / farewell" --> GFB["greeting_farewell_kb\n(ChromaDB 직접 조회 ~0.01s)"]
+    RU -- "템플릿 (affirm/deny/repeat/clarification 등)" --> TMPL["template_response\n(LLM 0회)"]
+    RU -- "booking" --> BOOK["booking_agent\n(LLM + Tool Use Loop)"]
+    RU -- "transfer" --> TRF["transfer_handler\n(Contact KB → SIP REFER)"]
+    RU -- "knowledge (question/complaint/help)" --> CC["check_cache\n(qa_cache 시맨틱 검색)"]
 
     CC -->|HIT ~0.1s| GHIT["generate_response\n(캐시 즉시)"]
     CC -->|MISS| RW["rewrite_query\n(짧은 발화·대명사 시)"]
@@ -335,7 +313,7 @@ flowchart TD
 4. **기본 폴백** — LLM 사용 불가 환경에서 짧은 발화는 `question` 처리
 5. **LLM 병합 호출** — 단일 LLM 요청으로 `intent` + `search_query` 동시 생성 (기존 2회 호출을 1회로 통합)
 
-### 3.5 멀티테넌트 격리
+### 3.4 멀티테넌트 격리
 
 ```mermaid
 flowchart TB
@@ -359,7 +337,7 @@ flowchart TB
 
 벡터 검색·SQLite 조회 모두 `where={owner}` 필터를 강제하므로, 같은 LLM·같은 인프라 위에서도 데이터가 절대 섞이지 않습니다.
 
-### 3.6 채널 통합 — 음성·문자·연결음·아웃바운드
+### 3.5 채널 통합 — 음성·문자·연결음·아웃바운드
 
 | 채널 | 입출력 | 공유 자원 |
 |------|--------|-----------|
