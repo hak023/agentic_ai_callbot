@@ -1,9 +1,5 @@
 # Project Brief: Agentic AI Callbot — 듣고, 이해하고, 처리하는 통화 비서
 
-**작성일**: 2026-04-28  
-**버전**: 1.0  
-**상태**: 발표용 소개 문서
-
 ---
 
 ## Executive Summary
