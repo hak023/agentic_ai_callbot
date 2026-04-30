@@ -85,7 +85,31 @@ Agentic AI Callbot은 표준 SIP 기반 통화 제어 위에 실시간 음성 AI
 
 ![Diagram 6](images/diagram_6.png)
 
-### 3.2 LangGraph 의도 라우팅 구조
+### 3.2 블록형 아키텍처 (플랫폼·데이터·외부 서비스)
+
+플랫폼을 **블록형**으로 정리한 그림입니다.  
+**좌측 주 영역(중앙 스택)**은 핵심 통화 및 AI 기능을 위→아래로 적층하고, **우측 기둥** 한 곳에 외부 연동과 저장소, 그리고 운영 정책·공통 관리를 위아래로 몰아서 배치했습니다.  
+또한 세로로 너무 길어지는 것을 방지하고, **레이어별로 부드러운 파스텔 톤 색상**을 다르게 적용하여 구조적 가독성을 한층 더 높였습니다.
+
+![블록형 아키텍처](images/diagram_block_architecture.png)
+
+> PNG 수정 시: `sip-pbx` 루트에서 `python docs/presentation/images/generate_block_arch_diagram.py`  
+> (matplotlib 필요: `pip install matplotlib`)
+
+**블록 요약**
+
+| 구역 | 색상 톤 | 포함 요소 |
+|------|---------|-----------|
+| **우측 (외부 연동·데이터)** | 🟩 연두 | **외부 AI/연동** (Google STT/TTS, Gemini, Calendar, Suno), **저장소** (SQLite, ChromaDB) |
+| **우측 (운영 정책·관리)** | 🟥 핑크 | **Call Control** (착신/시간대/발신 필터), **멀티테넌시·감사** (내선 격리, HITL 로그) |
+| **좌측 (접속·클라이언트)** | 🟦 파랑 | SIP 단말·트렁크, 웹 운영 콘솔 (Next.js, Call Dock) |
+| **좌측 (운영·API)** | 🩵 청록 | FastAPI REST, WebSocket / Socket.IO (실시간 이벤트) |
+| **좌측 (지식·에이전트)** | 🪻 남색 | LangGraph (의도 분류, 도구 호출), Active RAG (동적 지식 주입) |
+| **좌측 (실시간 음성 파이프라인)** | 🟨 노랑 | Pipecat 실시간 음성 제어(VAD·바지인), RTP 미디어, SIP 통화 제어(B2BUA) |
+
+설정에 따라 LLM·RAG 요약을 별도 DB에 적재하는 **옵션 로깅(asyncpg 등)** 이 붙을 수 있습니다 — 상세는 배포 환경의 `config` 기준입니다.
+
+### 3.3 LangGraph 의도 라우팅 구조
 
 17개 의도를 6 레인으로 라우팅합니다.
 
