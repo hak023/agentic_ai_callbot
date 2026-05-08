@@ -1,0 +1,6042 @@
+"""SIP Endpoint 구현
+
+Python 기반 SIP B2BUA 서버
+"""
+
+import os
+import signal
+import sys
+import asyncio
+import random
+import re
+import threading
+import time
+import uuid
+from typing import Any, Dict, Optional, Tuple
+
+from src.common.logger import get_async_logger
+from src.common.exceptions import SIPEndpointError, SIPTransportError
+from src.config.models import Config
+from src.sip_core.call_manager import CallManager
+from src.media.session_manager import MediaSessionManager
+from src.media.media_session import MediaMode
+from src.media.port_pool import PortPoolManager
+from src.media.sdp_parser import SDPParser, SDPManipulator
+from src.media.rtp_relay import RTPRelayWorker, RTPEndpoint
+from src.repositories.call_state_repository import CallStateRepository
+from src.sip_core.session_timer import SessionTimer
+from src.sip_core.transaction_timer import TransactionTimer
+from src.events.cdr import CDR, CDRWriter, TerminationReason
+from datetime import datetime
+
+logger = get_async_logger(__name__)
+
+# surrogateescape 디코딩 시 생기는 U+D800–U+DFFF 단일 코드포인트는 UTF-8(strict) 직렬화·파일 로그에서 실패한다.
+_SURROGATE_RANGE_RE = re.compile(r"[\uD800-\uDFFF]")
+
+
+def _sanitize_sip_text_for_utf8_io(text: str) -> str:
+    """로그·파일·JSON·print 용 — SIP 본문 바이트 보존 경로와 분리해 표시만 치환."""
+    if not text:
+        return text
+    return _SURROGATE_RANGE_RE.sub("\ufffd", text)
+
+
+class SIPEndpoint:
+    """Mock SIP Endpoint (개발/테스트용)
+    
+    실제 UDP 소켓을 열고 기본적인 SIP 메시지를 수신합니다.
+    완전한 B2BUA 기능 포함 (시그널링 + 미디어 릴레이)
+    """
+    
+    def __init__(self, config: Config):
+        """초기화
+        
+        Args:
+            config: 설정 객체
+        """
+        self.config = config
+        self._running = False
+        self._socket = None
+        self._listen_task = None
+        self._sip_log_file = None
+        self._sip_shutdown_done = False
+        
+        # 등록된 사용자 저장소: {username: {'ip', 'port', 'contact', 'from'}}
+        self._registered_users: Dict[str, Dict] = {}
+
+        # SIP MESSAGE 클라이언트 트랜잭션 (채팅 릴레이): Call-ID → threading.Event
+        self._message_txn_lock = threading.Lock()
+        self._message_txn_pending: Dict[str, Dict[str, Any]] = {}
+        # 일부 UA는 MESSAGE 200 OK 의 최상단 Via branch 가 요청과 달라질 수 있어, Call-ID 매칭만으로도 완료 처리해야 한다.
+        # Linphone 등이 IMDN·압축 처리 후 200 OK를 ~15s 넘게 두는 사례 있음(sip_traffic 상 200이 wait 직후 도착)
+        self._chat_message_txn_timeout_sec = 20.0
+        # 동일 Call-ID·CSeq MESSAGE 재전송/UDP 중복 시 DB·WS·AI·릴레이 중복 방지 (RFC 3261: 200 OK만 반복)
+        self._inbound_message_seen: Dict[str, float] = {}
+        self._inbound_message_seen_lock = threading.Lock()
+        self._inbound_message_seen_ttl_sec = 64.0
+        
+        # 활성 통화 저장소: {call_id: {'caller_addr', 'callee_addr', 'caller_tag', 'callee_tag', ...}}
+        self._active_calls: Dict[str, Dict] = {}
+        
+        # B2BUA Call Mapping: {original_call_id: new_call_id}
+        self._call_mapping: Dict[str, str] = {}
+        
+        # B2BUA IP 캐싱 (SDP c= 라인용)
+        self._cached_b2bua_ip = None
+        
+        # Call Manager 및 Media Session Manager 초기화
+        self._port_pool = PortPoolManager(config=config.media.port_pool)
+        
+        # MediaMode 변환 (config.models.MediaMode → media_session.MediaMode)
+        mode_value = config.media.mode.value.lower()
+        if mode_value == "direct":
+            media_mode = MediaMode.DIRECT
+        elif mode_value == "bypass":
+            media_mode = MediaMode.BYPASS
+        else:
+            media_mode = MediaMode.REFLECTING
+        
+        self._media_session_manager = MediaSessionManager(
+            port_pool=self._port_pool,
+            default_mode=media_mode
+        )
+        self._call_repository = CallStateRepository()
+        
+        # 녹음 설정 (config.yaml에서 가져오기)
+        # recording 설정은 ai_voicebot 하위에 있음
+        ai_voicebot_config = getattr(config, 'ai_voicebot', None)
+        logger.debug("config_debug_step1", has_ai_voicebot=ai_voicebot_config is not None)
+        
+        recording_config = None
+        gcp_credentials_path = None
+        enable_post_stt = False
+        stt_language = "ko-KR"
+        
+        if ai_voicebot_config:
+            recording_config = getattr(ai_voicebot_config, 'recording', None)
+            logger.debug("config_debug_step2", has_recording=recording_config is not None)
+            
+            # GCP 인증 파일 경로
+            google_cloud_config = getattr(ai_voicebot_config, 'google_cloud', None)
+            if google_cloud_config:
+                gcp_credentials_path = getattr(google_cloud_config, 'credentials_path', None)
+                logger.debug("config_debug_step3", gcp_path=gcp_credentials_path)
+        
+        # STT 설정
+        if recording_config:
+            post_stt_config = getattr(recording_config, 'post_processing_stt', None)
+            logger.debug("config_debug_step4", has_post_stt=post_stt_config is not None)
+            
+            if post_stt_config:
+                enable_post_stt = getattr(post_stt_config, 'enabled', False)
+                stt_language = getattr(post_stt_config, 'language', "ko-KR")
+                
+                logger.info("stt_config_loaded",
+                           enable_post_stt=enable_post_stt,
+                           stt_language=stt_language,
+                           has_gcp_credentials=gcp_credentials_path is not None)
+        else:
+            logger.warning("config_debug_no_recording", 
+                          has_ai_voicebot=ai_voicebot_config is not None)
+        
+        # ⭐ Knowledge Extractor 초기화 (지식 추출 활성화)
+        knowledge_extractor = None
+        if recording_config:
+            knowledge_extraction_config = getattr(recording_config, 'knowledge_extraction', None)
+            logger.info("🔧 [Knowledge Extraction] Config check",
+                       has_config=knowledge_extraction_config is not None,
+                       enabled=getattr(knowledge_extraction_config, 'enabled', None) if knowledge_extraction_config else None)
+            
+            if knowledge_extraction_config and getattr(knowledge_extraction_config, 'enabled', False):
+                try:
+                    logger.info("🔧 [Knowledge Extraction] Starting initialization...")
+                    
+                    import time
+                    import_start = time.time()
+                    
+                    logger.info("🔄 [Knowledge Import] Step 1/4: Importing KnowledgeExtractor...")
+                    from src.ai_voicebot.knowledge.knowledge_extractor import KnowledgeExtractor
+                    step1_time = time.time() - import_start
+                    logger.info(f"✅ [Knowledge Import] Step 1/4 completed ({step1_time:.3f}s)")
+                    
+                    logger.info("🔄 [Knowledge Import] Step 2/4: Importing LLMClient...")
+                    from src.ai_voicebot.ai_pipeline.llm_client import LLMClient
+                    step2_time = time.time() - import_start - step1_time
+                    logger.info(f"✅ [Knowledge Import] Step 2/4 completed ({step2_time:.3f}s)")
+                    
+                    logger.info("🔄 [Knowledge Import] Step 3/4: Importing TextEmbedder...")
+                    from src.ai_voicebot.knowledge.embedder import TextEmbedder
+                    step3_time = time.time() - import_start - step1_time - step2_time
+                    logger.info(f"✅ [Knowledge Import] Step 3/4 completed ({step3_time:.3f}s)")
+                    
+                    logger.info("🔄 [Knowledge Import] Step 4/4: Importing get_chromadb_client...")
+                    from src.ai_voicebot.knowledge.chromadb_client import get_vector_db, get_chroma_persist_path
+                    step4_time = time.time() - import_start - step1_time - step2_time - step3_time
+                    logger.info(f"✅ [Knowledge Import] Step 4/4 completed ({step4_time:.3f}s)")
+                    
+                    total_import_time = time.time() - import_start
+                    logger.info("🔧 [Knowledge Extraction] Modules imported successfully", 
+                               total_time=f"{total_import_time:.3f}s")
+                    
+                    # LLM 클라이언트 초기화
+                    logger.info("🔧 [Knowledge Extraction] Initializing LLM client...")
+                    
+                    # Gemini 설정 가져오기 (dict로 정의되어 있음)
+                    gemini_config = getattr(config.ai_voicebot.google_cloud, 'gemini', None)
+                    if not gemini_config:
+                        raise ValueError("Gemini configuration not found in config.ai_voicebot.google_cloud.gemini")
+                    
+                    from src.common.gemini_api_key import resolve_gemini_api_key
+
+                    api_key = resolve_gemini_api_key()
+                    if not api_key:
+                        raise ValueError(
+                            "Gemini API key not set: set GEMINI_API_KEY or GOOGLE_API_KEY in the environment"
+                        )
+                    
+                    # Gemini config dict 구성 (지식 정제 입력/출력 길이 포함)
+                    _get = gemini_config.get if isinstance(gemini_config, dict) else lambda k, d=None: getattr(gemini_config, k, d)
+                    gemini_config_dict = {
+                        "model": _get('model', 'gemini-2.5-flash-lite'),
+                        "temperature": _get('temperature', 0.5),
+                        "max_tokens": _get('max_output_tokens', 256),
+                        "max_output_tokens": _get('max_output_tokens', 256),
+                        "judgment_max_output_tokens": _get('judgment_max_output_tokens', 2048),
+                        "judgment_max_input_chars": _get('judgment_max_input_chars', 6000),
+                        "top_p": _get('top_p', 1.0),
+                        "top_k": _get('top_k', 1),
+                    }
+                    llm_client = LLMClient(config=gemini_config_dict, api_key=api_key)
+                    logger.info("🔧 [Knowledge Extraction] LLM client initialized",
+                               model=gemini_config_dict.get("model"))
+                    
+                    # Embedder 초기화
+                    logger.info("🔧 [Knowledge Extraction] Initializing Embedder...")
+                    embedding_config = getattr(config.ai_voicebot, 'embedding', None)
+                    # embedding도 dict일 수 있음
+                    if isinstance(embedding_config, dict):
+                        embedder = TextEmbedder(
+                            model_name=embedding_config.get('model', 'paraphrase-multilingual-mpnet-base-v2'),
+                            dimension=embedding_config.get('dimension', 768),
+                            batch_size=embedding_config.get('batch_size', 32)
+                        )
+                    else:
+                        embedder = TextEmbedder(
+                            model_name=getattr(embedding_config, 'model', 'paraphrase-multilingual-mpnet-base-v2') if embedding_config else 'paraphrase-multilingual-mpnet-base-v2',
+                            dimension=getattr(embedding_config, 'dimension', 768) if embedding_config else 768,
+                            batch_size=getattr(embedding_config, 'batch_size', 32) if embedding_config else 32
+                        )
+                    logger.info("🔧 [Knowledge Extraction] Embedder initialized")
+                    
+                    # VectorDB 초기화 (단일 클라이언트: get_vector_db()가 동기 초기화 수행)
+                    logger.info("🔧 [Knowledge Extraction] Initializing ChromaDB...")
+                    chromadb_init_start = time.time()
+                    persist_dir = get_chroma_persist_path()
+                    logger.info("🔄 [ChromaDB Init] Using single ChromaDB client (get_chromadb_client)...",
+                               persist_directory=persist_dir)
+                    vector_db = get_vector_db()
+                    chromadb_elapsed = time.time() - chromadb_init_start
+                    if not vector_db:
+                        raise RuntimeError(
+                            "ChromaDB sync init failed (get_vector_db returned None). "
+                            "위 직전 로그에 'ChromaDB sync init failed' 원인 표시. "
+                            "스키마 오류(no such column: collections.topic) 시: pip install 'chromadb>=0.5.0' 또는 data/chroma 폴더 삭제 후 재시작. docs/reports/CHROMA_COLLECTIONS_TOPIC_ERROR.md"
+                        )
+                    logger.info("✅ [Knowledge Extraction] ChromaDB initialized",
+                               elapsed=f"{chromadb_elapsed:.3f}s")
+                    
+                    # Knowledge Extractor 생성 (v1 또는 v2)
+                    # knowledge_extraction_config를 dict로 변환
+                    if isinstance(knowledge_extraction_config, dict):
+                        ke_config_dict = knowledge_extraction_config
+                    else:
+                        ke_config_dict = {}
+                        for attr in ['min_confidence', 'chunk_size', 'chunk_overlap', 'version',
+                                     'steps', 'quality', 'auto_approve', 'min_text_length',
+                                     'max_llm_calls_per_extraction', 'skip_short_calls_seconds']:
+                            val = getattr(knowledge_extraction_config, attr, None)
+                            if val is not None:
+                                ke_config_dict[attr] = val
+                    
+                    pipeline_version = ke_config_dict.get('version', 'v1')
+                    
+                    if pipeline_version == 'v2':
+                        logger.info("🔧 [Knowledge Extraction] Creating Pipeline v2...")
+                        from src.ai_voicebot.knowledge.extraction_pipeline import ExtractionPipeline
+                        knowledge_extractor = ExtractionPipeline(
+                            llm_client=llm_client,
+                            embedder=embedder,
+                            vector_db=vector_db,
+                            config=ke_config_dict,
+                        )
+                        logger.info("✅ Knowledge Extraction Pipeline v2 initialized")
+                    else:
+                        min_confidence = ke_config_dict.get('min_confidence', 0.7)
+                        chunk_size = ke_config_dict.get('chunk_size', 500)
+                        chunk_overlap = ke_config_dict.get('chunk_overlap', 50)
+                        
+                        logger.info("🔧 [Knowledge Extraction] Creating KnowledgeExtractor v1...",
+                                   min_confidence=min_confidence,
+                                   chunk_size=chunk_size,
+                                   chunk_overlap=chunk_overlap)
+                        
+                        knowledge_extractor = KnowledgeExtractor(
+                            llm_client=llm_client,
+                            embedder=embedder,
+                            vector_db=vector_db,
+                            min_confidence=min_confidence,
+                            chunk_size=chunk_size,
+                            chunk_overlap=chunk_overlap,
+                            min_text_length=ke_config_dict.get("min_text_length", 10),
+                            pii_review_queue_enabled=ke_config_dict.get("pii_review_queue_enabled", False),
+                            extraction_pending_file=ke_config_dict.get("extraction_pending_file") or "data/extraction_pending_review.jsonl",
+                        )
+                        logger.info("✅ Knowledge Extractor v1 initialized")
+                except Exception as e:
+                    logger.error("❌ Knowledge Extractor initialization failed", 
+                               error=str(e),
+                               error_type=type(e).__name__,
+                               exc_info=True)
+                    # 실패해도 서버는 계속 실행
+                    knowledge_extractor = None
+            else:
+                logger.warning("⚠️ Knowledge Extraction disabled or config missing",
+                             has_config=knowledge_extraction_config is not None,
+                             enabled=getattr(knowledge_extraction_config, 'enabled', None) if knowledge_extraction_config else None)
+        
+        # ⭐ AI Orchestrator 전달 (config._ai_orchestrator에서 가져오기)
+        ai_orchestrator_from_config = getattr(config, '_ai_orchestrator', None)
+        
+        self._call_manager = CallManager(
+            call_repository=self._call_repository,
+            media_session_manager=self._media_session_manager,
+            b2bua_ip=config.sip.listen_ip,
+            ai_orchestrator=ai_orchestrator_from_config,  # ⭐ AI Orchestrator 전달
+            no_answer_timeout=config.sip.timers.no_answer_timeout,
+            knowledge_extractor=knowledge_extractor,  # ⭐ Knowledge Extractor 전달
+            gcp_credentials_path=gcp_credentials_path,
+            enable_post_stt=enable_post_stt,
+            stt_language=stt_language
+        )
+        
+        # CallManager에 SIP Endpoint 참조 설정 (Pipecat RTP Worker 접근용)
+        self._call_manager.set_sip_endpoint(self)
+        
+        # RTP Relay Workers: {call_id: RTPRelayWorker}
+        self._rtp_workers: Dict[str, RTPRelayWorker] = {}
+
+        # Ringback Players: {call_id: RingbackPlayer}  (18x early media 구간)
+        self._ringback_players: Dict[str, Any] = {}
+
+        # ★ Transfer Manager 초기화
+        self._transfer_manager = None
+        transfer_config = {}
+        if ai_voicebot_config:
+            transfer_config_raw = getattr(ai_voicebot_config, 'transfer', None)
+            if transfer_config_raw:
+                if isinstance(transfer_config_raw, dict):
+                    transfer_config = transfer_config_raw
+                else:
+                    # Pydantic model → dict
+                    transfer_config = transfer_config_raw.model_dump() if hasattr(transfer_config_raw, 'model_dump') else {}
+            
+            if not transfer_config:
+                # extra fields에서 가져오기
+                try:
+                    raw_dict = ai_voicebot_config.model_dump() if hasattr(ai_voicebot_config, 'model_dump') else {}
+                    transfer_config = raw_dict.get('transfer', {}) or {}
+                except Exception:
+                    transfer_config = {}
+        
+        transfer_enabled = transfer_config.get('enabled', True) if transfer_config else True
+        if transfer_enabled:
+            from src.sip_core.transfer_manager import TransferManager
+            self._transfer_manager = TransferManager(config=transfer_config)
+            self._transfer_manager.set_callbacks(
+                send_invite=self.send_transfer_invite,
+                send_cancel=self.send_transfer_cancel,
+                send_bye=self.send_transfer_bye,
+                switch_to_bridge=self.switch_to_bridge_mode,
+                emit_event=self._emit_transfer_event,
+                preclear_callee=self._preclear_callee_for_dock_transfer,
+            )
+            logger.info("transfer_manager_initialized")
+
+        # WebSocket·API 등에서 src.call_transfer.manager.initiate_call_transfer /
+        # manual_transfer_from_operator 가 전역 TransferManager 를 쓰므로 SIPEndpoint
+        # 에서 만든 인스턴스를 반드시 등록한다.
+        from src.call_transfer.manager import set_transfer_manager as _set_call_transfer_manager_global
+
+        _set_call_transfer_manager_global(self._transfer_manager)
+        
+        # ★ Outbound Manager 초기화
+        self._outbound_manager = None
+        outbound_config = {}
+        if ai_voicebot_config:
+            outbound_config_raw = getattr(ai_voicebot_config, 'outbound', None)
+            if outbound_config_raw:
+                if isinstance(outbound_config_raw, dict):
+                    outbound_config = outbound_config_raw
+                else:
+                    outbound_config = outbound_config_raw.model_dump() if hasattr(outbound_config_raw, 'model_dump') else {}
+            
+            if not outbound_config:
+                try:
+                    raw_dict = ai_voicebot_config.model_dump() if hasattr(ai_voicebot_config, 'model_dump') else {}
+                    outbound_config = raw_dict.get('outbound', {}) or {}
+                except Exception:
+                    outbound_config = {}
+        
+        outbound_enabled = outbound_config.get('enabled', True) if outbound_config else False
+        if outbound_enabled:
+            from src.sip_core.outbound_manager import OutboundCallManager
+            self._outbound_manager = OutboundCallManager(config=outbound_config)
+            self._outbound_manager.set_callbacks(
+                send_invite=self.send_outbound_invite,
+                send_cancel=self.send_outbound_cancel,
+                send_bye=self.send_outbound_bye,
+                emit_event=self._emit_outbound_event,
+            )
+            logger.info("outbound_manager_initialized")
+        
+        # SIP 타이머 초기화
+        self._session_timer = SessionTimer(
+            session_expires=config.sip.timers.session_expires,
+            min_se=config.sip.timers.min_se,
+            default_refresher=config.sip.timers.session_refresher
+        )
+        self._transaction_timer = TransactionTimer(
+            t1=config.sip.timers.t1,
+            t2=config.sip.timers.t2,
+            t4=config.sip.timers.t4
+        )
+        
+        # CDR Writer 초기화 (통화 이력 기록, config에서 pretty_json 반영)
+        cdr_output_dir = getattr(config.cdr, "output_dir", "./cdr") or "./cdr"
+        cdr_pretty_json = getattr(config.cdr, "pretty_json", False)
+        self._cdr_writer = CDRWriter(
+            output_dir=cdr_output_dir,
+            pretty_json=cdr_pretty_json,
+        )
+        logger.info(
+            "CDR writer initialized for SIP Endpoint",
+            output_dir=cdr_output_dir,
+            pretty_json=cdr_pretty_json,
+        )
+        
+        # SIP 트래픽 로그 파일 설정
+        self._setup_sip_traffic_log()
+        
+        logger.info("sip_endpoint_created",
+                      message="SIP B2BUA endpoint initialized (signaling + media relay)",
+                      timers={
+                          "session_expires": config.sip.timers.session_expires,
+                          "t1": config.sip.timers.t1,
+                          "bye_timeout": config.sip.timers.bye_timeout
+                      })
+    
+    @property
+    def media_session_manager(self) -> MediaSessionManager:
+        """MediaSessionManager 접근자"""
+        return self._media_session_manager
+    
+    @property
+    def port_pool(self) -> PortPoolManager:
+        """PortPoolManager 접근자"""
+        return self._port_pool
+    
+    @property
+    def call_manager(self) -> CallManager:
+        """CallManager 접근자"""
+        return self._call_manager
+
+    async def shutdown_sip_recording_ingest(self) -> None:
+        """녹음 RTP 인입 워커 graceful shutdown (`CallManager` 위임)."""
+        if self._call_manager:
+            await self._call_manager.shutdown_sip_recording_ingest()
+
+    @property
+    def transfer_manager(self):
+        """TransferManager 접근자"""
+        return self._transfer_manager
+    
+    @property
+    def outbound_manager(self):
+        """OutboundCallManager 접근자"""
+        return self._outbound_manager
+    
+    async def _emit_outbound_event(self, event_type: str, data: dict):
+        """Outbound 이벤트 발행 (WebSocket)"""
+        try:
+            try:
+                from src.websocket import manager as ws_manager
+                if ws_manager:
+                    await ws_manager.broadcast_global(event_type, data)
+            except ImportError:
+                pass
+        except Exception as e:
+            logger.error(
+                "outbound_event_emit_error",
+                event_type=event_type,
+                error=str(e),
+            )
+    
+    async def _emit_transfer_event(self, event_type: str, data: dict):
+        """Transfer 이벤트 발행 (WebSocket)"""
+        try:
+            try:
+                from src.websocket import manager as ws_manager
+                if ws_manager:
+                    await ws_manager.broadcast_global(event_type, data)
+            except ImportError:
+                pass
+        except Exception as e:
+            logger.error(
+                "transfer_event_broadcast_error",
+                event_type=event_type,
+                error=str(e),
+            )
+    
+    def _setup_sip_traffic_log(self) -> None:
+        """SIP 트래픽 로그 파일 설정"""
+        from pathlib import Path
+        from datetime import datetime
+        
+        # 로그 디렉토리 생성
+        log_dir = Path("logs")
+        log_dir.mkdir(exist_ok=True)
+        
+        # 로그 파일 경로 (날짜별)
+        timestamp = datetime.now().strftime("%Y%m%d")
+        log_file_path = log_dir / f"sip_traffic_{timestamp}.log"
+        
+        try:
+            self._sip_log_file = open(log_file_path, 'a', encoding='utf-8', buffering=1)
+            logger.info("sip_traffic_log_opened", log_file=str(log_file_path))
+        except Exception as e:
+            logger.error("sip_traffic_log_open_failed", error=str(e))
+            self._sip_log_file = None
+    
+    def _get_b2bua_ip(self) -> str:
+        """B2BUA IP 가져오기 (SDP c= 라인용)
+        
+        Returns:
+            str: B2BUA가 사용할 IP 주소
+        """
+        if self._cached_b2bua_ip:
+            return self._cached_b2bua_ip
+            
+        # 1. 설정에 advertised_ip가 있으면 사용
+        b2bua_ip = getattr(self.config.sip, 'advertised_ip', None)
+        
+        if b2bua_ip:
+            logger.info("b2bua_ip_from_config", ip=b2bua_ip)
+            self._cached_b2bua_ip = b2bua_ip
+            return b2bua_ip
+        
+        # 2. listen_ip가 0.0.0.0이 아니면 사용
+        b2bua_ip = self.config.sip.listen_ip
+        if b2bua_ip != "0.0.0.0":
+            self._cached_b2bua_ip = b2bua_ip
+            return b2bua_ip
+        
+        # 3. 자동 감지: 외부로 연결 시도하여 실제 사용되는 로컬 IP 가져오기
+        import socket
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            b2bua_ip = s.getsockname()[0]
+            s.close()
+            logger.info("b2bua_ip_auto_detected", ip=b2bua_ip, method="udp_connect")
+        except:
+            # Fallback: hostname 사용
+            try:
+                b2bua_ip = socket.gethostbyname(socket.gethostname())
+                logger.info("b2bua_ip_auto_detected", ip=b2bua_ip, method="hostname")
+            except:
+                b2bua_ip = "127.0.0.1"
+                logger.warning("b2bua_ip_fallback", ip=b2bua_ip)
+        
+        self._cached_b2bua_ip = b2bua_ip
+        return b2bua_ip
+    
+    def _log_sip_message(self, direction: str, message: str, addr: tuple) -> None:
+        """SIP 메시지를 파일에 로깅
+        
+        Args:
+            direction: 'RECV' 또는 'SEND'
+            message: SIP 메시지
+            addr: 주소 (ip, port)
+        """
+        from datetime import datetime
+        
+        if not self._sip_log_file:
+            return
+        
+        try:
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            emoji = "📥" if direction == "RECV" else "📤"
+            
+            safe_msg = _sanitize_sip_text_for_utf8_io(message)
+            log_entry = (
+                f"\n{'='*70}\n"
+                f"{emoji} SIP {direction} [{timestamp}] {addr[0]}:{addr[1]}\n"
+                f"{'='*70}\n"
+                f"{safe_msg}\n"
+                f"{'='*70}\n"
+            )
+            
+            # 파일 핸들이 유효한지 확인
+            if self._sip_log_file.closed:
+                logger.error("sip_log_file_closed", direction=direction, addr=f"{addr[0]}:{addr[1]}")
+                return
+            
+            self._sip_log_file.write(log_entry)
+            # ⚠️ flush()는 동기 I/O로 이벤트 루프를 블로킹할 수 있으므로 제거
+            # line-buffered 모드(buffering=1)로 open하여 줄 단위 자동 플러시
+            
+        except OSError as e:
+            # 파일 I/O 에러 (Errno 22 등)
+            logger.error("sip_traffic_log_write_failed", 
+                        error=str(e),
+                        error_type=type(e).__name__,
+                        errno=e.errno if hasattr(e, 'errno') else 'N/A',
+                        direction=direction,
+                        addr=f"{addr[0]}:{addr[1]}")
+        except Exception as e:
+            # 기타 에러
+            logger.error("sip_traffic_log_unexpected_error", 
+                        error=str(e),
+                        error_type=type(e).__name__,
+                        direction=direction,
+                        addr=f"{addr[0]}:{addr[1]}")
+    
+    async def _handle_sip_message(self, data: bytes, addr: tuple) -> None:
+        """SIP 메시지 처리
+        
+        Args:
+            data: 수신한 데이터
+            addr: 송신자 주소 (ip, port)
+        """
+        try:
+            # 빈 패킷 무시
+            if len(data) == 0:
+                logger.debug("empty_packet_received", from_addr=f"{addr[0]}:{addr[1]}")
+                return
+            
+            # UTF-8 기본; 본문에 바이너리(gzip IMDN 등)가 있으면 surrogateescape 로 바이트 보존
+            # (latin-1 폴백은 로그/터미널에서 깨져 보이고, UTF-8 재인코딩 시 본문이 손상될 수 있음)
+            try:
+                message = data.decode("utf-8")
+            except UnicodeDecodeError:
+                message = data.decode("utf-8", errors="surrogateescape")
+                logger.info(
+                    "sip_datagram_decode_utf8_surrogateescape",
+                    from_addr=f"{addr[0]}:{addr[1]}",
+                    size=len(data),
+                    note="MESSAGE 등 비 UTF-8 바이트 포함 — 릴레이 시 동일 바이트 보존",
+                )
+            
+            # 빈 메시지 또는 너무 짧은 메시지 무시
+            message_stripped = message.strip()
+            if len(message_stripped) < 10:
+                logger.debug("message_too_short", 
+                           size=len(data),
+                           raw_bytes=data.hex(),
+                           from_addr=f"{addr[0]}:{addr[1]}")
+                return
+            
+            # SIP 메서드 파싱
+            lines = message.split('\r\n')
+            if not lines or not lines[0]:
+                logger.warning("no_request_line", from_addr=f"{addr[0]}:{addr[1]}")
+                return
+                
+            request_line = lines[0].strip()
+            parts = request_line.split()
+            if len(parts) < 2:
+                logger.warning("invalid_request_line", 
+                             request_line=request_line,
+                             from_addr=f"{addr[0]}:{addr[1]}")
+                return
+            
+            method = parts[0]
+            
+            # 📥 RECV 로그 (비동기 logger 사용, DEBUG 레벨)
+            logger.debug(
+                "sip_recv_raw",
+                direction="RECV",
+                from_addr=f"{addr[0]}:{addr[1]}",
+                size=len(data),
+                message=_sanitize_sip_text_for_utf8_io(message),
+            )
+            
+            # 파일에 로깅 (try-except로 보호)
+            try:
+                self._log_sip_message("RECV", message, addr)
+            except Exception as log_err:
+                # 파일 로그 실패해도 서버는 계속 동작
+                logger.warning("sip_file_log_failed_on_recv", 
+                             error=str(log_err),
+                             error_type=type(log_err).__name__,
+                             from_addr=f"{addr[0]}:{addr[1]}")
+            
+            # 로그: 요청인지 응답인지 구분
+            if message.startswith('SIP/2.0'):
+                # SIP 응답 메시지 (200 OK, 180 Ringing 등)
+                status_code = parts[1] if len(parts) > 1 else 'UNKNOWN'
+                
+                # CSeq에서 method 추출 (예: "CSeq: 1 INVITE" → "INVITE")
+                cseq_method = "UNKNOWN"
+                for line in lines:
+                    if line.lower().startswith('cseq:'):
+                        cseq_parts = line.split()
+                        if len(cseq_parts) >= 3:
+                            cseq_method = cseq_parts[2]  # CSeq: 1 INVITE
+                        break
+                
+                logger.info("sip_recv",
+                           direction="RECV",
+                           status_code=status_code,
+                           method=cseq_method,  # 어떤 메소드의 응답인지
+                           from_addr=f"{addr[0]}:{addr[1]}",
+                           size=len(data))
+            else:
+                # SIP 요청 메시지 (INVITE, REGISTER 등)
+                logger.info("sip_recv",
+                           direction="RECV",
+                           method=method,
+                           from_addr=f"{addr[0]}:{addr[1]}",
+                           size=len(data))
+            
+            # 응답 생성 및 전송
+            response = None
+            if method == 'OPTIONS':
+                response = self._create_options_response(message, addr)
+                if response:
+                    self._send_response(response, addr)
+            elif method == 'REGISTER':
+                response = self._handle_register(message, addr)
+                if response:
+                    self._send_response(response, addr)
+            elif method == 'INVITE':
+                # B2BUA INVITE 처리 (비동기)
+                asyncio.create_task(self._handle_invite_b2bua(message, addr))
+            elif method == 'ACK':
+                # ACK 처리 (SIP Dialog 완료, RTP는 200 OK 시점에 이미 시작됨)
+                self._handle_ack(message, addr)
+            elif method == 'BYE':
+                # BYE 처리 (세션 종료)
+                asyncio.create_task(self._handle_bye(message, addr))
+            elif method == 'CANCEL':
+                # CANCEL 처리
+                asyncio.create_task(self._handle_cancel(message, addr))
+            elif method == 'MESSAGE':
+                # SIP MESSAGE (RFC 3428) — 본문은 raw bytes 로 charset/CPIM 처리
+                asyncio.create_task(self._handle_sip_message_method(data, addr))
+            else:
+                # SIP 응답 메시지 (180, 200 OK 등)
+                if message.startswith('SIP/2.0'):
+                    asyncio.create_task(self._handle_sip_response(message, addr))
+                else:
+                    logger.warning("sip_method_not_implemented", method=method)
+                    response = self._create_not_implemented_response(message, addr)
+                    if response:
+                        self._send_response(response, addr)
+                    
+        except Exception as e:
+            logger.error("sip_message_handling_error", 
+                        error=str(e), 
+                        error_type=type(e).__name__,
+                        from_addr=f"{addr[0]}:{addr[1]}" if isinstance(addr, tuple) and len(addr) == 2 else str(addr),
+                        exc_info=True)
+    
+    def _send_response(self, response: str, addr: tuple) -> None:
+        """응답 전송 및 로깅
+        
+        Args:
+            response: SIP 응답 메시지
+            addr: 대상 주소 (ip, port)
+        """
+        try:
+            # addr가 tuple인지 확인
+            if not isinstance(addr, tuple) or len(addr) != 2:
+                logger.error("invalid_addr_format_for_sendto", 
+                           addr=str(addr), 
+                           addr_type=type(addr).__name__,
+                           expected="tuple (ip, port)")
+                return
+            
+            # 소켓 전송
+            self._socket.sendto(response.encode('utf-8'), addr)
+            
+        except OSError as e:
+            # 소켓 에러 (Errno 22 등)
+            logger.error("socket_sendto_failed", 
+                        error=str(e), 
+                        errno=e.errno if hasattr(e, 'errno') else 'N/A',
+                        to_addr=f"{addr[0]}:{addr[1]}" if isinstance(addr, tuple) and len(addr) == 2 else str(addr),
+                        exc_info=True)
+            return
+        except Exception as e:
+            # 기타 에러
+            logger.error("sendto_unexpected_error", 
+                        error=str(e), 
+                        error_type=type(e).__name__,
+                        to_addr=f"{addr[0]}:{addr[1]}" if isinstance(addr, tuple) and len(addr) == 2 else str(addr),
+                        exc_info=True)
+            return
+        
+        # 📤 SEND 로그 (비동기 logger 사용, DEBUG 레벨)
+        logger.debug("sip_send_raw",
+                    direction="SEND",
+                    to_addr=f"{addr[0]}:{addr[1]}",
+                    size=len(response),
+                    message=response)
+        
+        # 파일에 로깅 (try-except로 보호)
+        try:
+            self._log_sip_message("SEND", response, addr)
+        except Exception as log_err:
+            # 파일 로그 실패해도 서버는 계속 동작
+            logger.warning("sip_file_log_failed_on_send", 
+                         error=str(log_err),
+                         error_type=type(log_err).__name__,
+                         to_addr=f"{addr[0]}:{addr[1]}")
+        
+        # 로그: 요청인지 응답인지 구분
+        lines = response.split('\r\n')
+        if lines and ' ' in lines[0]:
+            parts = lines[0].split()
+            if response.startswith('SIP/2.0'):
+                # SIP 응답 메시지 (200 OK, 180 Ringing 등)
+                status_code = parts[1] if len(parts) > 1 else 'UNKNOWN'
+                
+                # CSeq에서 method 추출 (예: "CSeq: 1 INVITE" → "INVITE")
+                cseq_method = "UNKNOWN"
+                for line in lines:
+                    if line.lower().startswith('cseq:'):
+                        cseq_parts = line.split()
+                        if len(cseq_parts) >= 3:
+                            cseq_method = cseq_parts[2]  # CSeq: 1 INVITE
+                        break
+                
+                logger.info("sip_send",
+                           direction="SEND",
+                           status_code=status_code,
+                           method=cseq_method,  # 어떤 메소드의 응답인지
+                           to_addr=f"{addr[0]}:{addr[1]}",
+                           size=len(response))
+            else:
+                # SIP 요청 메시지 (BYE, INVITE 등)
+                method = parts[0] if len(parts) > 0 else 'UNKNOWN'
+                logger.info("sip_send",
+                           direction="SEND",
+                           method=method,
+                           to_addr=f"{addr[0]}:{addr[1]}",
+                           size=len(response))
+        else:
+            logger.info("sip_send",
+                       direction="SEND",
+                       method="UNKNOWN",
+                       to_addr=f"{addr[0]}:{addr[1]}",
+                       size=len(response))
+    
+    def _extract_username(self, sip_uri: str) -> str:
+        """From/To/P-Asserted-Identity 등 헤더 값에서 user 부분 추출 (sip(s):·tel:)."""
+        from src.sip_core.sip_identity_parse import parse_sip_identity_from_header_value
+
+        return parse_sip_identity_from_header_value(sip_uri or "")
+    
+    def _extract_tag(self, header: str) -> Optional[str]:
+        """헤더에서 tag 파라미터 추출
+        
+        Args:
+            header: SIP 헤더 (From, To 등)
+            
+        Returns:
+            str: tag 값 (없으면 None)
+        """
+        match = re.search(r';tag=([^;>\s]+)', header)
+        if match:
+            return match.group(1)
+        return None
+
+    @staticmethod
+    def _extract_top_via_branch(sip_message: str) -> str:
+        """첫 Via 헤더의 branch 파라미터 (MESSAGE 클라이언트 트랜잭션·프록시 응답 매칭)."""
+        for line in (sip_message or "").split("\r\n"):
+            if line.lower().startswith("via:"):
+                m = re.search(r"branch=([^;\s]+)", line, re.I)
+                return (m.group(1).strip() if m else "") or ""
+        return ""
+    
+    def _extract_sdp_body(self, message: str) -> Optional[str]:
+        """SIP 메시지에서 SDP body 추출
+        
+        Args:
+            message: 전체 SIP 메시지
+            
+        Returns:
+            str: SDP body (없으면 None)
+        """
+        # 헤더와 body는 \r\n\r\n으로 구분
+        parts = message.split('\r\n\r\n', 1)
+        if len(parts) > 1 and parts[1].strip():
+            return parts[1].strip()
+        return None
+    
+    async def _handle_sip_response(self, response: str, addr: tuple) -> None:
+        """SIP 응답 메시지 처리 (180, 200 OK 등)
+        
+        Args:
+            response: SIP 응답 메시지
+            addr: 송신자 주소
+        """
+        try:
+            # 응답 코드 추출
+            lines = response.split('\r\n')
+            if not lines:
+                return
+            
+            status_line = lines[0]
+            parts = status_line.split()
+            if len(parts) < 3:
+                return
+            
+            status_code = parts[1]
+            call_id = self._extract_header(response, 'Call-ID')
+            cseq = self._extract_header(response, 'CSeq')
+            
+            logger.debug("sip_response_received", status_code=status_code, call_id=call_id)
+
+            try:
+                sc_int = int(status_code)
+            except ValueError:
+                sc_int = 0
+            if call_id and cseq and "MESSAGE" in cseq.upper() and sc_int >= 200:
+                if self._complete_chat_message_client_txn(call_id, status_code, response=response):
+                    logger.info(
+                        "sip_message_response_matched",
+                        call_id=call_id,
+                        status_code=status_code,
+                        from_addr=f"{addr[0]}:{addr[1]}",
+                        cseq=cseq,
+                    )
+                    return
+
+            # ★ Outbound 콜 응답 처리
+            outbound_call_info = self._active_calls.get(call_id)
+            if outbound_call_info and outbound_call_info.get('is_outbound'):
+                await self.handle_outbound_response(response, addr, outbound_call_info)
+                return
+            
+            # ★ Transfer 레그 응답 처리
+            transfer_call_info = self._active_calls.get(call_id)
+            if transfer_call_info and transfer_call_info.get('is_transfer'):
+                await self.handle_transfer_response(response, addr, transfer_call_info)
+                return
+            
+            # B2BUA Call-ID 매핑 확인
+            original_call_id = self._call_mapping.get(call_id)
+            if not original_call_id or original_call_id not in self._active_calls:
+                # ✅ 예외: 487 Request Terminated는 call cleanup 후에도 ACK를 보내야 함
+                # (CANCEL 전송 후 call이 cleanup된 경우)
+                if status_code == '487' and 'INVITE' in cseq:
+                    logger.info("487_after_cleanup_sending_ack",
+                               call_id=call_id,
+                               original_call_id=original_call_id)
+                    
+                    # Call-ID mapping이 없으면 call_id를 직접 사용 (B2BUA → UAS leg)
+                    await self._send_ack_for_487_without_call_info(response, addr)
+                    return
+                
+                logger.debug("response_for_unknown_call", call_id=call_id)
+                return
+            
+            call_info = self._active_calls[original_call_id]
+            
+            # 응답 릴레이
+            if status_code in ['180', '183']:  # Ringing, Session Progress
+                logger.debug("relaying_response", status_code=status_code, call_id=original_call_id)
+                # ⚠️ 중요: 180 Ringing에서도 To tag를 추출해야 함!
+                # RFC 3261: Early Dialog 생성을 위해 180부터 tag가 있어야 함
+                to_hdr = self._extract_header(response, 'To')
+                callee_tag = self._extract_tag(to_hdr)
+                if callee_tag and not call_info.get('callee_tag'):
+                    call_info['callee_tag'] = callee_tag
+                    logger.info("callee_tag_from_180", 
+                               call_id=original_call_id, 
+                               callee_tag=callee_tag)
+                
+                # Transaction Timer: 1xx 응답 수신 (PROCEEDING 상태로 변경)
+                transaction_id = call_info.get('transaction_id')
+                if transaction_id:
+                    await self._transaction_timer.response_received(
+                        transaction_id=transaction_id,
+                        status_code=int(status_code)
+                    )
+                
+                await self._relay_response_to_caller(response, call_info)
+            
+            elif status_code == '200' and 'INVITE' in cseq:  # 200 OK for INVITE
+                logger.info("relaying_200ok", call_id=original_call_id)
+
+                # 🎵 Ringback Player 종료 (착신 200 OK 릴레이 전에 반드시 끝까지 대기)
+                await self._stop_ringback_player(original_call_id)
+
+                # no_answer_timeout 타이머 취소 (착신자가 응답함)
+                no_answer_timer = call_info.get('no_answer_timer')
+                if no_answer_timer and not no_answer_timer.done():
+                    no_answer_timer.cancel()
+                    call_info.pop('no_answer_timer', None)
+                    logger.info("no_answer_timer_cancelled_on_200ok",
+                               call_id=original_call_id)
+                
+                # Callee tag 저장 (180에서 이미 저장되었을 수 있음)
+                to_hdr = self._extract_header(response, 'To')
+                callee_tag = self._extract_tag(to_hdr)
+                if callee_tag:
+                    # 180의 tag와 일치하는지 확인
+                    existing_tag = call_info.get('callee_tag')
+                    if existing_tag and existing_tag != callee_tag:
+                        logger.warning("callee_tag_mismatch",
+                                     call_id=original_call_id,
+                                     tag_180=existing_tag,
+                                     tag_200=callee_tag)
+                    call_info['callee_tag'] = callee_tag
+                call_info['state'] = 'answered'
+                call_info['answer_time'] = datetime.now()  # CDR용 통화 응답 시간
+
+                # 대시보드 실시간 통화: Repository 세션을 ESTABLISHED로 갱신
+                if self.call_manager:
+                    self.call_manager.mark_b2bua_established(original_call_id)
+                # WebSocket: B2BUA 경로는 CallManager ACK를 타지 않으므로 여기서 call_started 발송
+                try:
+                    from src.websocket import manager as ws_manager
+                    caller_uri = f"sip:{call_info.get('caller_username', '')}@{call_info.get('caller_addr', ('', 0))[0]}"
+                    callee_uri = f"sip:{call_info.get('callee_username', '')}@{call_info.get('callee_addr', ('', 0))[0]}"
+                    _now = datetime.now().isoformat()
+                    _at = call_info.get("answer_time")
+                    logger.info(
+                        "b2bua_ws_emit_call_started_scheduled",
+                        call_id=original_call_id,
+                        caller=caller_uri,
+                        callee=callee_uri,
+                        sip_phase="answered",
+                        note="착신 200 OK 후 Socket.IO call_started(연결됨)",
+                    )
+                    asyncio.create_task(ws_manager.emit_call_started(
+                        original_call_id,
+                        {
+                            "caller": caller_uri,
+                            "callee": callee_uri,
+                            "is_ai_handled": call_info.get("ai_mode_activated", False),
+                            "status": "통화 연결됨 (착신 응답)",
+                            "sip_phase": "answered",
+                            "timestamp": _now,
+                            "started_at": _at.isoformat() if _at and hasattr(_at, "isoformat") else _now,
+                        },
+                    ))
+                    # B2BUA 유저 간: CallManager ACK 경로 없을 수 있음 → call_data_record에 연결 행 보강
+                    if not call_info.get("ai_mode_activated", False):
+                        try:
+                            from src.common.call_data_record_logger import log_call_data
+                            from src.common.knowledge_call_data_helpers import chroma_context_for_call_data
+
+                            _cm = self.call_manager
+                            log_call_data(
+                                original_call_id,
+                                "call_event",
+                                "call_connected",
+                                mode="human_human",
+                                path="b2bua_200_ok",
+                                is_ai_handled=False,
+                                realtime_llm_intent_rag="none",
+                                note="B2BUA 응답 200 OK 시점. 사후 지식 추출은 CallManager.cleanup_terminated_call에서 스케줄.",
+                                recording_enabled=bool(_cm and getattr(_cm, "recording_enabled", False)),
+                                knowledge_extractor_configured=bool(
+                                    _cm and getattr(_cm, "knowledge_extractor", None) is not None
+                                ),
+                                **chroma_context_for_call_data(),
+                            )
+                        except Exception as _e:
+                            logger.debug("b2bua_human_call_connected_call_data_failed", error=str(_e))
+                except Exception as e:
+                    logger.warning("b2bua_call_started_ws_failed", call_id=original_call_id, error=str(e))
+                
+                # Transaction Timer: 200 OK 수신 (COMPLETED 상태로 변경 및 종료)
+                transaction_id = call_info.get('transaction_id')
+                if transaction_id:
+                    await self._transaction_timer.response_received(
+                        transaction_id=transaction_id,
+                        status_code=int(status_code)
+                    )
+                    logger.info("invite_transaction_completed",
+                               transaction_id=transaction_id,
+                               call_id=original_call_id)
+                
+                # Session Timer 시작 (장시간 통화 유지)
+                await self._session_timer.start_timer(
+                    call_id=original_call_id,
+                    expires=self.config.sip.timers.session_expires,
+                    refresher=self.config.sip.timers.session_refresher,
+                    refresh_callback=lambda cid: asyncio.create_task(self._send_session_update(cid))
+                )
+                logger.info("session_timer_started",
+                           call_id=original_call_id,
+                           expires=self.config.sip.timers.session_expires)
+                
+                await self._relay_response_to_caller(response, call_info)
+                logger.info("call_answered_waiting_ack",
+                           call_id=original_call_id,
+                           session_refresh_interval=f"{self.config.sip.timers.session_expires / 2}s")
+            
+            elif status_code == '200' and 'BYE' in cseq:  # 200 OK for BYE
+                if call_info.get("skip_full_cleanup_on_callee_bye_200"):
+                    call_info["skip_full_cleanup_on_callee_bye_200"] = False
+                    bye_transaction_id = call_info.get("bye_transaction_id")
+                    if bye_transaction_id:
+                        await self._transaction_timer.terminate_transaction(bye_transaction_id)
+                    logger.info(
+                        "callee_leg_bye_200_partial_cleanup",
+                        call_id=original_call_id,
+                        note="Dock 돌려주기 등 — 발신자 세션 유지, 착신 레그만 종료",
+                    )
+                    return
+
+                logger.info("call_terminated", call_id=original_call_id)
+                
+                # BYE Transaction Timer 종료
+                bye_transaction_id = call_info.get('bye_transaction_id')
+                if bye_transaction_id:
+                    await self._transaction_timer.terminate_transaction(bye_transaction_id)
+                    logger.info("bye_transaction_completed",
+                               transaction_id=bye_transaction_id,
+                               call_id=original_call_id)
+                
+                # 세션 정리 (Session Timer 포함)
+                await self._cleanup_call(original_call_id)
+            
+            # 에러 응답 처리 (3xx, 4xx, 5xx, 6xx)
+            # RFC 3261: 모든 최종 응답(2xx 제외)에 대해 ACK가 필요함
+            elif status_code.startswith(('3', '4', '5', '6')):
+                # ✅ AI 모드 체크: 487은 CANCEL의 결과이므로 AI 모드에서는 caller에게 relay하지 않음
+                is_ai_mode = call_info.get('ai_mode_activated', False)
+                
+                if status_code == '487' and is_ai_mode:
+                    logger.info("487_not_relayed_ai_mode",
+                               call_id=original_call_id,
+                               ai_mode=True)
+                    
+                    # RFC 3261: Non-2xx 최종 응답(3xx-6xx)에 대해 ACK를 Callee에게 전송
+                    await self._send_ack_for_error_response(response, call_info)
+                    
+                    # ⚠️ caller에게는 relay하지 않음 (이미 200 OK를 보냈음)
+                    # call cleanup도 하지 않음 (AI 세션 진행 중)
+                    return
+                
+                logger.info("relaying_final_response", status_code=status_code, call_id=original_call_id)
+                logger.info("final_response_received",
+                           call_id=original_call_id,
+                           status_code=status_code,
+                           reason=parts[2] if len(parts) > 2 else "Unknown")
+                
+                # RFC 3261: Non-2xx 최종 응답(3xx-6xx)에 대해 ACK를 Callee에게 전송
+                # INVITE Transaction을 완료하기 위해 필요
+                await self._send_ack_for_error_response(response, call_info)
+                
+                # 에러 응답을 caller에게 릴레이
+                await self._relay_response_to_caller(response, call_info)
+                
+                # 통화 종료 처리
+                await self._cleanup_call(original_call_id)
+            
+        except Exception as e:
+            logger.error("response_handling_error", error=str(e))
+
+    def _caller_early_media_sdp_for_1xx(self, original_call_id: str, b2bua_ip: str) -> Optional[str]:
+        """착신 180/183 에 SDP 가 없을 때 발신자에게 PBX caller leg RTP 포트를 알려 최소 early media 를 연다."""
+        media_session = self.media_session_manager.get_session(original_call_id)
+        if not media_session or media_session.mode == MediaMode.DIRECT:
+            return None
+        rtp = media_session.caller_leg.get_audio_rtp_port()
+        rtcp = media_session.caller_leg.get_audio_rtcp_port()
+        if not rtp:
+            return None
+        parts = [
+            "v=0",
+            f"o=- 0 0 IN IP4 {b2bua_ip}",
+            "s=PBX early media",
+            f"c=IN IP4 {b2bua_ip}",
+            "t=0 0",
+            f"m=audio {rtp} RTP/AVP 0",
+            "a=rtpmap:0 PCMU/8000",
+        ]
+        if rtcp:
+            parts.append(f"a=rtcp:{rtcp}")
+        return "\r\n".join(parts) + "\r\n"
+    
+    async def _relay_response_to_caller(self, callee_response: str, call_info: Dict) -> None:
+        """Callee의 응답을 Caller에게 릴레이
+        
+        Args:
+            callee_response: Callee로부터 받은 응답
+            call_info: 통화 정보
+        """
+        try:
+            # 원본 INVITE의 헤더를 사용해서 응답 생성
+            lines = callee_response.split('\r\n')
+            if not lines:
+                return
+                
+            status_line = lines[0]  # SIP/2.0 200 OK 등
+            
+            # 원본 Call-ID 찾기
+            original_call_id = None
+            for orig_id, new_id in self._call_mapping.items():
+                if new_id == call_info['b2bua_call_id']:
+                    original_call_id = orig_id
+                    break
+            
+            if not original_call_id:
+                logger.error("original_call_id_not_found", b2bua_call_id=call_info['b2bua_call_id'])
+                return
+            
+            # 원본 INVITE에서 Via, From, To, CSeq를 저장해야 함
+            # 지금은 call_info에서 복원
+            from_hdr = call_info['original_from']
+            to_hdr = call_info['original_to']
+            if call_info.get('callee_tag'):
+                to_hdr += f";tag={call_info['callee_tag']}"
+            
+            # 원본 Via와 branch를 저장해야 함 - call_info에 추가 필요
+            via_branch = call_info.get('original_via_branch', 'z9hG4bK-unknown')
+            via = f"SIP/2.0/UDP {call_info['caller_addr'][0]}:{call_info['caller_addr'][1]};branch={via_branch};rport"
+            
+            # Callee 응답에서 추가 헤더 복사 (Contact, Allow 등)
+            allow_hdr = self._extract_header(callee_response, 'Allow')
+            
+            # SDP 추출 (있으면)
+            callee_sdp = self._extract_sdp_body(callee_response)
+            
+            # B2BUA IP 가져오기 (SDP c= 라인용)
+            b2bua_ip = self._get_b2bua_ip()
+            
+            # Contact 헤더를 B2BUA 주소로 rewrite (RFC 3261)
+            # 200 OK의 Contact가 ACK의 Request-URI가 되므로 항상 B2BUA 주소여야 함!
+            # (Direct 모드에서도 SIP 시그널링은 B2BUA 경유)
+            contact_hdr = f"<sip:{call_info['callee_username']}@{b2bua_ip}:{self.config.sip.listen_port}>"
+            
+            # 📝 Callee SDP Rewrite (200 OK 응답)
+            rewritten_sdp = None
+            if callee_sdp:
+                logger.debug("rewriting_callee_sdp", call_id=original_call_id)
+                
+                # MediaSession에 Callee SDP 업데이트
+                try:
+                    self.media_session_manager.update_callee_sdp(original_call_id, callee_sdp)
+                    media_session = self.media_session_manager.get_session(original_call_id)
+                    
+                    if media_session:
+                        # Direct 모드 확인
+                        if media_session.mode == MediaMode.DIRECT:
+                            # Direct 모드: SDP만 수정하지 않고 그대로 전달
+                            # (Contact는 B2BUA 주소 - SIP 시그널링은 B2BUA 경유!)
+                            rewritten_sdp = callee_sdp
+                            logger.info("direct_media_mode_enabled",
+                                       call_id=original_call_id,
+                                       message="SDP not modified (direct RTP), Contact=B2BUA (signaling via B2BUA)")
+                        else:
+                            # Bypass/Reflecting 모드: B2BUA가 중계
+                            # 1. 벤더 특정 속성 제거 (a=X-nat:0 등)
+                            rewritten_sdp = SDPManipulator.remove_vendor_attributes(callee_sdp)
+                            
+                            # 2. Origin IP를 B2BUA IP로 교체 (o= 라인)
+                            rewritten_sdp = SDPManipulator.replace_origin_ip(rewritten_sdp, b2bua_ip)
+                            
+                            # 3. Connection IP를 B2BUA IP로 교체 (c= 라인)
+                            rewritten_sdp = SDPManipulator.replace_connection_ip(rewritten_sdp, b2bua_ip)
+                            
+                            # 4. Audio 포트를 Caller Leg 할당 포트로 교체
+                            caller_audio_port = media_session.caller_leg.get_audio_rtp_port()
+                            caller_audio_rtcp_port = media_session.caller_leg.get_audio_rtcp_port()
+                            
+                            if caller_audio_port:
+                                rewritten_sdp = SDPManipulator.replace_media_port(rewritten_sdp, "audio", caller_audio_port)
+                                logger.debug("sdp_rewritten",
+                                           call_id=original_call_id,
+                                           o=b2bua_ip,
+                                           c=b2bua_ip,
+                                           m_audio=caller_audio_port)
+                            
+                            # 5. RTCP 포트를 SHORT FORMAT으로 변경 (원본 SDP에 a=rtcp:가 있는 경우만)
+                            # 클라이언트 호환성을 위해 항상 short format (a=rtcp:PORT) 사용
+                            if caller_audio_rtcp_port and SDPManipulator.has_rtcp_attribute(callee_sdp, "audio"):
+                                rewritten_sdp = SDPManipulator.replace_rtcp_attribute(rewritten_sdp, "audio", caller_audio_rtcp_port, b2bua_ip)
+                                logger.debug("rtcp_port_rewritten",
+                                           call_id=original_call_id,
+                                           rtcp_port=caller_audio_rtcp_port)
+                        
+                            # 🎵 7. RTP Relay 업데이트 (200 OK 시점에 Callee endpoint 정보 반영)
+                        # Early Bind로 이미 소켓은 bind되었으므로, Callee endpoint만 업데이트
+                        logger.debug("updating_rtp_relay_callee_endpoint", call_id=original_call_id)
+                        
+                        # 이미 RTP Worker가 시작되었는지 확인
+                        if original_call_id in self._rtp_workers:
+                            # Callee endpoint 업데이트
+                            rtp_worker = self._rtp_workers[original_call_id]
+                            callee_ip = media_session.callee_leg.original_ip
+                            callee_rtp_port = media_session.callee_leg.original_audio_port
+                            callee_rtcp_port = media_session.callee_leg.original_audio_rtcp_port
+                            
+                            if callee_ip and callee_rtp_port and callee_rtcp_port:
+                                rtp_worker.update_callee_endpoint(callee_ip, callee_rtp_port, callee_rtcp_port)
+                                logger.info("callee_endpoint_updated",
+                                           call_id=original_call_id,
+                                           callee_ip=callee_ip,
+                                           callee_rtp_port=callee_rtp_port,
+                                           callee_rtcp_port=callee_rtcp_port)
+                            else:
+                                logger.error("callee_endpoint_info_missing",
+                                           call_id=original_call_id,
+                                           callee_ip=callee_ip,
+                                           callee_rtp_port=callee_rtp_port,
+                                           callee_rtcp_port=callee_rtcp_port)
+                        else:
+                            # Early Bind가 실패했거나 아직 안 됨 (fallback)
+                            logger.warning("rtp_worker_not_found_fallback", call_id=original_call_id)
+                            rtp_success = await self._start_rtp_relay(original_call_id)
+                            
+                            if not rtp_success:
+                                logger.error("rtp_relay_start_failed_at_200ok", call_id=original_call_id)
+                            else:
+                                logger.info("rtp_relay_started_fallback", call_id=original_call_id)
+                        
+                        # TODO: Video 지원 시 video 포트도 교체
+                    else:
+                        logger.warning("media_session_not_found_for_sdp_rewrite", call_id=original_call_id)
+                        rewritten_sdp = callee_sdp  # Fallback: SDP 그대로
+                        
+                except Exception as sdp_err:
+                    logger.error("callee_sdp_rewrite_error", error=str(sdp_err), exc_info=True)
+                    rewritten_sdp = callee_sdp  # Fallback: SDP 그대로
+
+            # Linphone 등: 180 Ringing 만 오고 본문이 없으면 발신 단말이 early RTP 를 열지 않아 링백이 무음일 수 있음.
+            if not rewritten_sdp:
+                sl_parts = status_line.split()
+                sc = sl_parts[1] if len(sl_parts) >= 2 and sl_parts[0] == "SIP/2.0" else ""
+                if sc in ("180", "183"):
+                    injected = self._caller_early_media_sdp_for_1xx(original_call_id, b2bua_ip)
+                    if injected:
+                        rewritten_sdp = injected
+                        logger.info(
+                            "caller_1xx_sdp_injected_for_early_media",
+                            call_id=original_call_id,
+                            status_code=sc,
+                            note="착신 1xx 무본문 — PBX caller leg SDP 주입",
+                        )
+            
+            # 응답 구성
+            response_to_caller = f"{status_line}\r\n"
+            response_to_caller += f"Via: {via}\r\n"
+            response_to_caller += f"From: {from_hdr}\r\n"
+            response_to_caller += f"To: {to_hdr}\r\n"
+            response_to_caller += f"Call-ID: {original_call_id}\r\n"
+            
+            # ✅ 원본 INVITE의 CSeq 사용 (RFC 3261: Response의 CSeq = Request의 CSeq)
+            original_cseq = call_info.get('original_cseq', '1 INVITE')
+            response_to_caller += f"CSeq: {original_cseq}\r\n"
+            
+            response_to_caller += f"Contact: {contact_hdr}\r\n"
+            if allow_hdr:
+                response_to_caller += f"Allow: {allow_hdr}\r\n"
+            
+            # SDP가 있으면 추가 (Rewritten SDP 사용)
+            if rewritten_sdp:
+                response_to_caller += "Content-Type: application/sdp\r\n"
+                response_to_caller += f"Content-Length: {len(rewritten_sdp)}\r\n"
+                response_to_caller += "\r\n"
+                response_to_caller += rewritten_sdp
+            else:
+                response_to_caller += "Content-Length: 0\r\n"
+                response_to_caller += "\r\n"
+            
+            self._send_response(response_to_caller, call_info['caller_addr'])
+            
+        except Exception as e:
+            logger.error("relay_response_error", error=str(e), exc_info=True)
+    
+    async def _send_ack_for_error_response(self, error_response: str, call_info: Dict) -> None:
+        """Non-2xx 최종 응답(3xx-6xx)에 대한 ACK를 Callee에게 전송
+        
+        RFC 3261: Non-2xx final response에 대해서는 UAC(B2BUA)가 ACK를 보내야 함.
+        이 ACK는 INVITE transaction을 완료하기 위한 것이며, 별도의 transaction이 아님.
+        
+        Args:
+            error_response: Callee로부터 받은 최종 응답 (3xx-6xx)
+            call_info: 통화 정보
+        """
+        try:
+            # Callee 주소 가져오기
+            callee_addr = call_info.get('callee_addr')
+            callee_username = call_info.get('callee_username')
+            caller_username = call_info.get('caller_username')
+            
+            if not callee_addr or not callee_username:
+                logger.error("ack_for_error_missing_info",
+                           call_id=call_info.get('original_call_id'),
+                           has_callee_addr=bool(callee_addr),
+                           has_callee_username=bool(callee_username))
+                return
+            
+            # 응답에서 상태 코드 추출
+            lines = error_response.split('\r\n')
+            status_line = lines[0] if lines else ""
+            status_parts = status_line.split()
+            status_code = status_parts[1] if len(status_parts) > 1 else "Unknown"
+            
+            # 에러 응답에서 To 태그 추출
+            to_hdr = self._extract_header(error_response, 'To')
+            callee_tag = self._extract_tag(to_hdr)
+            
+            # 응답에서 CSeq 추출 (원본 INVITE의 CSeq 번호 사용)
+            cseq_header = self._extract_header(error_response, 'CSeq')
+            if not cseq_header:
+                logger.error("ack_cseq_missing",
+                           call_id=call_info.get('original_call_id'),
+                           response_preview=error_response)
+                return
+            
+            # CSeq 헤더 파싱 (예: "CSeq: 1 INVITE" → "1")
+            cseq_parts = cseq_header.split()
+            if len(cseq_parts) < 1:
+                logger.error("ack_cseq_invalid",
+                           call_id=call_info.get('original_call_id'),
+                           cseq_header=cseq_header)
+                return
+            
+            cseq_number = cseq_parts[0]  # CSeq 번호 추출
+            
+            # ACK 구성
+            # Request-URI: RFC 3261에 따라 응답의 Contact 헤더가 있으면 사용, 없으면 To URI 사용
+            contact_header = self._extract_header(error_response, 'Contact')
+            if contact_header:
+                # Contact 헤더에서 URI 추출 (예: "<sip:user@host:port>" 또는 "sip:user@host:port")
+                contact_uri = contact_header.strip()
+                # 꺾쇠 괄호 제거
+                if contact_uri.startswith('<') and contact_uri.endswith('>'):
+                    contact_uri = contact_uri[1:-1]
+                # 파라미터 제거 (예: ";expires=3600")
+                if ';' in contact_uri:
+                    contact_uri = contact_uri.split(';')[0].strip()
+                request_uri = contact_uri
+                logger.debug("ack_using_contact_header",
+                           call_id=call_info.get('original_call_id'),
+                           contact_uri=contact_uri)
+            else:
+                # Contact 헤더가 없으면 To URI 사용
+                request_uri = f"sip:{callee_username}@{callee_addr[0]}:{callee_addr[1]}"
+                logger.debug("ack_using_to_uri",
+                           call_id=call_info.get('original_call_id'),
+                           request_uri=request_uri)
+            
+            # Via, From, To, Call-ID, CSeq
+            b2bua_call_id = call_info.get('b2bua_call_id')
+            from_tag = call_info.get('b2bua_from_tag')  # B2BUA가 callee에게 보낸 From tag
+            
+            # ✅ B2BUA IP 가져오기 (0.0.0.0이나 None 방지)
+            b2bua_ip = self._get_b2bua_ip()
+            listen_port = self.config.sip.listen_port
+            
+            # ✅ Via는 응답의 Via 헤더를 그대로 사용 (RFC 3261: Non-2xx ACK)
+            # 응답에서 Via 추출
+            via_from_response = self._extract_header(error_response, 'Via')
+            if via_from_response:
+                via = via_from_response.strip()
+            else:
+                # Via가 없으면 fallback (정상적인 상황에서는 발생하지 않음)
+                via_branch = f"z9hG4bK{random.randint(100000, 999999)}"
+                via = f"SIP/2.0/UDP {b2bua_ip}:{listen_port};branch={via_branch}"
+                logger.warning("ack_via_not_found_in_response",
+                             call_id=call_info.get('original_call_id'),
+                             using_fallback=True)
+            
+            # From, To
+            from_hdr = f"<sip:{caller_username}@{b2bua_ip}>;tag={from_tag}"
+            to_hdr_ack = f"<sip:{callee_username}@{b2bua_ip}>"
+            if callee_tag:
+                to_hdr_ack += f";tag={callee_tag}"
+            
+            # CSeq: 원본 INVITE의 CSeq 번호 사용 (method만 ACK로 변경)
+            cseq = f"{cseq_number} ACK"
+            
+            # ACK 메시지 생성
+            ack_message = (
+                f"ACK {request_uri} SIP/2.0\r\n"
+                f"Via: {via}\r\n"
+                f"From: {from_hdr}\r\n"
+                f"To: {to_hdr_ack}\r\n"
+                f"Call-ID: {b2bua_call_id}\r\n"
+                f"CSeq: {cseq}\r\n"
+                f"Max-Forwards: 70\r\n"
+                f"Content-Length: 0\r\n"
+                f"\r\n"
+            )
+            
+            # Callee에게 ACK 전송
+            self._send_response(ack_message, callee_addr)
+            
+            logger.info("ack_sent_for_final_response",
+                       call_id=b2bua_call_id,
+                       callee_addr=f"{callee_addr[0]}:{callee_addr[1]}",
+                       status_code=status_code,
+                       cseq_number=cseq_number)
+            
+        except Exception as e:
+            logger.error("send_ack_for_error_response_failed", 
+                        error=str(e), 
+                        exc_info=True)
+    
+    async def _send_ack_for_487_without_call_info(self, error_response: str, addr: tuple) -> None:
+        """Call cleanup 후 도착한 487에 대한 ACK 전송 (call_info 없이)
+        
+        Args:
+            error_response: UAS로부터 받은 487 응답
+            addr: UAS 주소 (응답을 보낸 주소)
+        """
+        try:
+            # 응답에서 Call-ID, To, From, CSeq, Via 추출
+            call_id = self._extract_header(error_response, 'Call-ID')
+            to_hdr = self._extract_header(error_response, 'To')
+            from_hdr = self._extract_header(error_response, 'From')
+            cseq_header = self._extract_header(error_response, 'CSeq')
+            via_from_response = self._extract_header(error_response, 'Via')
+            
+            if not all([call_id, to_hdr, from_hdr, cseq_header, via_from_response]):
+                logger.error("ack_487_missing_headers",
+                           call_id=call_id,
+                           has_to=bool(to_hdr),
+                           has_from=bool(from_hdr),
+                           has_cseq=bool(cseq_header),
+                           has_via=bool(via_from_response))
+                return
+            
+            # To tag 추출
+            callee_tag = self._extract_tag(to_hdr)
+            
+            # CSeq 번호 추출
+            cseq_parts = cseq_header.split()
+            if len(cseq_parts) < 1:
+                logger.error("ack_487_invalid_cseq", cseq_header=cseq_header)
+                return
+            cseq_number = cseq_parts[0]
+            
+            # Request-URI: Contact 헤더 우선, 없으면 To URI 사용
+            contact_header = self._extract_header(error_response, 'Contact')
+            if contact_header:
+                request_uri = contact_header.strip()
+                if request_uri.startswith('<') and request_uri.endswith('>'):
+                    request_uri = request_uri[1:-1]
+                if ';' in request_uri:
+                    request_uri = request_uri.split(';')[0].strip()
+            else:
+                # To URI에서 추출
+                request_uri = to_hdr.strip()
+                if request_uri.startswith('<') and request_uri.endswith('>'):
+                    request_uri = request_uri[1:-1]
+                if ';' in request_uri:
+                    request_uri = request_uri.split(';')[0].strip()
+            
+            # ACK 메시지 생성 (Via, From, To, Call-ID, CSeq를 응답에서 가져옴)
+            via = via_from_response.strip()
+            
+            # To 헤더 (tag 포함)
+            to_hdr_ack = to_hdr.strip()
+            
+            # From 헤더 (응답의 From을 그대로 사용)
+            from_hdr_ack = from_hdr.strip()
+            
+            # CSeq: ACK로 변경
+            cseq = f"{cseq_number} ACK"
+            
+            # ACK 메시지
+            ack_message = (
+                f"ACK {request_uri} SIP/2.0\r\n"
+                f"Via: {via}\r\n"
+                f"From: {from_hdr_ack}\r\n"
+                f"To: {to_hdr_ack}\r\n"
+                f"Call-ID: {call_id}\r\n"
+                f"CSeq: {cseq}\r\n"
+                f"Max-Forwards: 70\r\n"
+                f"Content-Length: 0\r\n"
+                f"\r\n"
+            )
+            
+            # UAS에게 ACK 전송
+            self._send_response(ack_message, addr)
+            
+            logger.info("ack_sent_for_487_after_cleanup",
+                       call_id=call_id,
+                       uas_addr=f"{addr[0]}:{addr[1]}",
+                       cseq_number=cseq_number)
+            logger.debug("ack_sent_for_487_after_cleanup", cseq_number=cseq_number, call_id=call_id)
+            
+        except Exception as e:
+            logger.error("send_ack_for_487_without_call_info_failed",
+                        error=str(e),
+                        exc_info=True)
+    
+    def _handle_ack(self, request: str, addr: tuple) -> None:
+        """ACK 처리 (SIP Dialog 완료)
+        
+        RTP Relay는 이미 200 OK 시점에 시작되었으므로,
+        ACK는 단순히 Callee에게 전달하고 호를 active 상태로 표시합니다.
+        
+        Args:
+            request: ACK 요청
+            addr: 송신자 주소
+        """
+        try:
+            call_id = self._extract_header(request, 'Call-ID')
+            
+            logger.info("ack_received_debug",
+                       call_id=call_id,
+                       from_addr=f"{addr[0]}:{addr[1]}",
+                       active_calls=list(self._active_calls.keys()))
+            
+            if call_id not in self._active_calls:
+                logger.warning("ack_ignored_no_active_call",
+                             call_id=call_id,
+                             active_calls=list(self._active_calls.keys()))
+                return
+        except Exception as e:
+            logger.error("ack_handling_error_early",
+                        error=str(e),
+                        exc_info=True)
+            return
+        
+        try:
+            call_info = self._active_calls[call_id]
+            logger.debug("ack_received_debug", call_id=call_id)
+        
+            # ✅ AI 모드 체크: AI가 응답한 경우 ACK를 callee에게 relay하지 않음
+            is_ai_mode = call_info.get('ai_mode_activated', False)
+            
+            if is_ai_mode:
+                logger.info("ack_received_ai_mode",
+                           call_id=call_id,
+                           ai_mode=True)
+                _fb_task = call_info.get("immediate_ai_ack_fallback_task")
+                if _fb_task and not _fb_task.done():
+                    _fb_task.cancel()
+                    logger.debug(
+                        "immediate_ai_ack_fallback_cancelled_on_ack",
+                        call_id=call_id,
+                    )
+                call_info["immediate_ai_ack_fallback_done"] = True
+
+                # AI 모드에서는 RTP가 이미 설정되었는지 확인
+                # Call state를 established로 변경
+                call_info['state'] = 'established'
+                logger.info("call_established",
+                           call_id=call_id,
+                           caller=call_info.get('caller_username'),
+                           callee='AI')
+                # AI 인사말이 ACK 이후에 재생되도록 대기 중인 이벤트 해제
+                if self.call_manager:
+                    self.call_manager.notify_call_established(call_id)
+                
+                return  # callee에게 ACK를 relay하지 않음
+            
+            # call_info 내용 확인
+            logger.info("ack_call_info",
+                       call_id=call_id,
+                       has_b2bua_call_id='b2bua_call_id' in call_info,
+                       has_callee_addr='callee_addr' in call_info,
+                       call_info_keys=list(call_info.keys()))
+            
+            # Callee에게 ACK 전달
+            new_call_id = call_info.get('b2bua_call_id')
+            callee_addr = call_info.get('callee_addr')
+            
+            if not new_call_id or not callee_addr:
+                logger.error("ack_missing_call_info",
+                            call_id=call_id,
+                            has_b2bua_call_id=bool(new_call_id),
+                            has_callee_addr=bool(callee_addr),
+                            call_info_keys=list(call_info.keys()))
+                return
+            
+            logger.info("ack_relay_start",
+                       call_id=call_id,
+                       new_call_id=new_call_id,
+                       callee_addr=f"{callee_addr[0]}:{callee_addr[1]}")
+            
+            # B2BUA IP 가져오기 (SDP c= 라인용)
+            b2bua_ip = self._get_b2bua_ip()
+        
+            # B2BUA가 INVITE에서 사용한 From tag와 동일하게 설정
+            b2bua_from_tag = call_info.get('b2bua_from_tag', 'b2bua')
+            
+            # ACK에 SDP가 있는지 확인 (일부 클라이언트는 ACK에 SDP 포함)
+            sdp_body = self._extract_sdp_body(request)
+            rewritten_sdp = ""
+            
+            logger.info("ack_sdp_check",
+                       call_id=call_id,
+                       has_sdp=bool(sdp_body))
+            
+            if sdp_body:
+                # SDP가 있으면 B2BUA IP/Port로 수정
+                media_session = self._media_session_manager.get_session(call_id)
+                logger.info("ack_media_session_check",
+                           call_id=call_id,
+                           has_media_session=media_session is not None)
+                
+                if media_session:
+                    # Direct 모드가 아니면 SDP 수정
+                    if media_session.mode != MediaMode.DIRECT:
+                        # Callee 쪽 RTP 포트 가져오기
+                        callee_audio_port = media_session.callee_leg.get_audio_rtp_port()
+                        callee_audio_rtcp_port = media_session.callee_leg.get_audio_rtcp_port()
+                        
+                        # SDP 수정: c= 필드를 B2BUA IP로, m= 포트를 서버 포트로
+                        rewritten_sdp = SDPManipulator.replace_connection_ip(sdp_body, b2bua_ip)
+                        rewritten_sdp = SDPManipulator.replace_origin_ip(rewritten_sdp, b2bua_ip)
+                        rewritten_sdp = SDPManipulator.replace_media_port(rewritten_sdp, "audio", callee_audio_port)
+                        
+                        # RTCP 포트를 SHORT FORMAT으로 변경 (원본 SDP에 a=rtcp:가 있는 경우만)
+                        if callee_audio_rtcp_port and SDPManipulator.has_rtcp_attribute(sdp_body, "audio"):
+                            rewritten_sdp = SDPManipulator.replace_rtcp_attribute(rewritten_sdp, "audio", callee_audio_rtcp_port, b2bua_ip)
+                        
+                        logger.info("ack_sdp_rewritten",
+                                   call_id=call_id,
+                                   b2bua_ip=b2bua_ip,
+                                   b2bua_port=callee_audio_port)
+                    else:
+                        # Direct 모드: SDP 그대로 전달
+                        rewritten_sdp = sdp_body
+                        logger.info("ack_sdp_direct_mode", call_id=call_id)
+            
+            # ACK 메시지 생성
+            ack_to_callee = (
+                f"ACK sip:{call_info['callee_username']}@{callee_addr[0]}:{callee_addr[1]} SIP/2.0\r\n"
+                f"Via: SIP/2.0/UDP {b2bua_ip}:{self.config.sip.listen_port};branch=z9hG4bK{random.randint(100000, 999999)}\r\n"
+                f"From: <sip:{call_info['caller_username']}@{b2bua_ip}>;tag={b2bua_from_tag}\r\n"
+                f"To: <sip:{call_info['callee_username']}@{b2bua_ip}>;tag={call_info.get('callee_tag', 'unknown')}\r\n"
+                f"Call-ID: {new_call_id}\r\n"
+                "CSeq: 1 ACK\r\n"
+                "Max-Forwards: 70\r\n"
+            )
+            
+            # SDP 추가 (있는 경우)
+            if rewritten_sdp:
+                ack_to_callee += "Content-Type: application/sdp\r\n"
+                ack_to_callee += f"Content-Length: {len(rewritten_sdp)}\r\n"
+                ack_to_callee += "\r\n"
+                ack_to_callee += rewritten_sdp
+            else:
+                ack_to_callee += "Content-Length: 0\r\n"
+                ack_to_callee += "\r\n"
+            
+            logger.info("ack_sending",
+                       call_id=call_id,
+                       to_addr=f"{callee_addr[0]}:{callee_addr[1]}",
+                       has_sdp=bool(rewritten_sdp))
+            
+            self._send_response(ack_to_callee, callee_addr)
+            
+            logger.info("ack_sent",
+                       call_id=call_id,
+                       to_addr=f"{callee_addr[0]}:{callee_addr[1]}")
+            
+            call_info['state'] = 'active'
+            
+            logger.info("call_established",
+                       caller=call_info['caller_username'],
+                       callee=call_info['callee_username'],
+                       call_id=call_id)
+        except Exception as e:
+            logger.error("ack_handling_error",
+                        call_id=call_id if 'call_id' in locals() else "unknown",
+                        error=str(e),
+                        exc_info=True)
+    
+    async def _start_rtp_relay(self, call_id: str) -> bool:
+        """RTP Relay 시작 (비동기)
+        
+        Args:
+            call_id: Call-ID
+            
+        Returns:
+            성공 여부 (True: 성공, False: 실패)
+        """
+        try:
+            # ✅ 이미 RTP Relay가 실행 중인지 체크 (200 OK 재전송 대응)
+            if call_id in self._rtp_workers:
+                logger.info("rtp_relay_already_running", call_id=call_id)
+                return True
+            
+            logger.debug("starting_rtp_relay", call_id=call_id)
+            media_session = self.media_session_manager.get_session(call_id)
+            logger.debug("media_session_check", call_id=call_id, found=media_session is not None)
+            
+            if not media_session:
+                logger.error("media_session_not_found_for_rtp", call_id=call_id)
+                return False
+            
+            # Caller/Callee SDP 정보 확인
+            logger.debug("sdp_info_check",
+                        call_id=call_id,
+                        caller_ip=media_session.caller_leg.original_ip,
+                        caller_port=media_session.caller_leg.original_audio_port,
+                        callee_ip=media_session.callee_leg.original_ip,
+                        callee_port=media_session.callee_leg.original_audio_port)
+            
+            # Caller SDP 체크 (필수)
+            if not media_session.caller_leg.original_ip or not media_session.caller_leg.original_audio_port:
+                logger.error("caller_sdp_info_missing", call_id=call_id)
+                return False
+            
+            # Caller Endpoint 정보 (SDP에서 가져온 원본 IP/Port)
+            caller_rtp_endpoint = RTPEndpoint(
+                ip=media_session.caller_leg.original_ip,
+                port=media_session.caller_leg.original_audio_port
+            )
+            
+            # Callee Endpoint: 200 OK 이전이면 Dummy 사용 (Early Bind)
+            # Callee SDP가 없어도 진행 가능 (Early Bind 지원)
+            if media_session.callee_leg.original_ip and media_session.callee_leg.original_audio_port:
+                callee_rtp_endpoint = RTPEndpoint(
+                    ip=media_session.callee_leg.original_ip,
+                    port=media_session.callee_leg.original_audio_port
+                )
+                is_early_bind = False
+                logger.debug("callee_sdp_available",
+                           call_id=call_id,
+                           callee_ip=media_session.callee_leg.original_ip,
+                           callee_port=media_session.callee_leg.original_audio_port)
+            else:
+                # Dummy endpoint (나중에 update_callee_endpoint로 업데이트)
+                callee_rtp_endpoint = RTPEndpoint(ip="0.0.0.0", port=0)
+                is_early_bind = True
+                logger.info("early_bind_mode_using_dummy_callee", call_id=call_id)
+            
+            logger.debug("creating_rtp_worker", call_id=call_id)
+            
+            # 🎙️ 녹음 활성화: CallManager의 sip_recorder 사용
+            sip_recorder = self._call_manager.sip_recorder if self._call_manager else None
+            
+            # RTP 소켓 bind IP 가져오기
+            # 1. config.yaml의 media.rtp_bind_ip 우선
+            # 2. 없으면 advertised_ip 사용
+            rtp_bind_ip = getattr(self.config.media, 'rtp_bind_ip', None)
+            source = "config"
+            if not rtp_bind_ip or rtp_bind_ip == "":
+                rtp_bind_ip = self._get_b2bua_ip()
+                source = "advertised_ip"
+            
+            logger.info("rtp_bind_ip_selected", 
+                       bind_ip=rtp_bind_ip,
+                       source=source,
+                       call_id=call_id)
+            
+            # RTP Relay Worker 생성 (녹음 포함)
+            rtp_worker = RTPRelayWorker(
+                media_session=media_session,
+                caller_endpoint=caller_rtp_endpoint,
+                callee_endpoint=callee_rtp_endpoint,
+                bind_ip=rtp_bind_ip,  # ✅ 설정 가능한 bind IP
+                ai_orchestrator=self.call_manager.ai_orchestrator if self.call_manager else None,  # AI 전달
+                sip_recorder=sip_recorder,  # ✅ 녹음 활성화!
+                rtp_tx_debug=bool(getattr(self.config.media, "rtp_tx_debug", False)),
+                rtp_tx_debug_path=getattr(self.config.media, "rtp_tx_debug_path", None),
+                ai_rtp_silence_keepalive=bool(
+                    getattr(self.config.media, "ai_rtp_silence_keepalive", True)
+                ),
+                ai_rtp_keepalive_interval_sec=float(
+                    getattr(self.config.media, "ai_rtp_keepalive_interval_sec", 8.0)
+                ),
+                ai_rtp_adaptive_interval_enabled=bool(
+                    getattr(self.config.media, "ai_rtp_adaptive_interval", {}).get("enabled", True)
+                ),
+                ai_rtp_adaptive_interval_thresholds=getattr(
+                    self.config.media, "ai_rtp_adaptive_interval", {}
+                ).get("thresholds", None),
+            )
+            
+            logger.debug("starting_rtp_worker", call_id=call_id)
+            # RTP Worker 시작
+            try:
+                await rtp_worker.start()
+                logger.info("rtp_worker_started_successfully", call_id=call_id)
+                
+                # 🎙️ 녹음 시작 (sip_recorder가 있으면)
+                if sip_recorder:
+                    call_info = self._active_calls.get(call_id)
+                    if call_info:
+                        caller_username = call_info.get('caller_username', 'unknown')
+                        callee_username = call_info.get('callee_username', 'unknown')
+                        _direction = "outbound" if call_info.get('is_outbound') else "inbound"
+                        await sip_recorder.start_recording(
+                            call_id=call_id,
+                            caller_id=caller_username,
+                            callee_id=callee_username,
+                            direction=_direction,
+                        )
+                        logger.info("recording_started",
+                                   call_id=call_id,
+                                   caller=caller_username,
+                                   callee=callee_username,
+                                   direction=_direction)
+                
+            except Exception as e:
+                logger.error("rtp_worker_start_failed", call_id=call_id, error=str(e), exc_info=True)
+                return False
+            
+            # Worker 저장 (종료 시 cleanup)
+            self._rtp_workers[call_id] = rtp_worker
+            
+            logger.info("rtp_relay_started",
+                       call_id=call_id,
+                       caller_endpoint=str(caller_rtp_endpoint),
+                       callee_endpoint=str(callee_rtp_endpoint),
+                       b2bua_ports_caller=media_session.caller_leg.allocated_ports[:2],
+                       b2bua_ports_callee=media_session.callee_leg.allocated_ports[:2])
+            
+            return True
+                
+        except Exception as rtp_err:
+            logger.error("rtp_relay_start_error", call_id=call_id, error=str(rtp_err), exc_info=True)
+            import traceback
+            traceback.print_exc()
+            return False
+    
+    async def _handle_bye(self, request: str, addr: tuple) -> None:
+        """BYE 처리 (세션 종료)
+        
+        Args:
+            request: BYE 요청
+            addr: 송신자 주소
+        """
+        try:
+            call_id = self._extract_header(request, 'Call-ID')
+            
+            logger.info("bye_received", call_id=call_id, from_addr=f"{addr[0]}:{addr[1]}")
+            
+            # ⭐ B2BUA Call-ID 매핑 확인 (착신→서버 BYE 처리를 위해)
+            # call_id가 _active_calls에 없으면 call_mapping을 통해 상대 call_id 찾기
+            # (_call_mapping은 양방향: orig→b2bua, b2bua→orig 모두 저장)
+            if call_id not in self._active_calls:
+                mapped_peer = self._call_mapping.get(call_id)
+                if mapped_peer and mapped_peer in self._active_calls:
+                    logger.info("bye_call_id_mapped",
+                               received_call_id=call_id,
+                               mapped_to=mapped_peer)
+                    call_id = mapped_peer
+                    logger.info("bye_call_id_resolved_via_mapping",
+                               call_id=call_id)
+                else:
+                    # 매핑에도 없거나, 이미 cleanup된 통화 (late BYE)
+                    logger.warning("bye_unknown_call",
+                                   call_id=call_id,
+                                   mapped_peer=mapped_peer,
+                                   active_calls=list(self._active_calls.keys()),
+                                   note="이미 cleanup된 통화의 late BYE일 가능성 높음")
+                    via = self._extract_header(request, 'Via')
+                    from_hdr = self._extract_header(request, 'From')
+                    to_hdr = self._extract_header(request, 'To')
+                    cseq = self._extract_header(request, 'CSeq')
+                    bye_response = (
+                        "SIP/2.0 200 OK\r\n"
+                        f"Via: {via}\r\n"
+                        f"From: {from_hdr}\r\n"
+                        f"To: {to_hdr}\r\n"
+                        f"Call-ID: {call_id}\r\n"
+                        f"CSeq: {cseq}\r\n"
+                        "Content-Length: 0\r\n"
+                        "\r\n"
+                    )
+                    self._send_response(bye_response, addr)
+                    return
+            
+            call_info = self._active_calls[call_id]
+            logger.info("bye_received", call_id=call_id)
+            
+            # ★ Outbound 콜 BYE 처리 - 착신자가 끊음
+            if call_info.get('is_outbound') and hasattr(self, '_outbound_manager') and self._outbound_manager:
+                logger.info("outbound_callee_bye", call_id=call_id)
+                # 200 OK 응답
+                via = self._extract_header(request, 'Via')
+                from_hdr_bye = self._extract_header(request, 'From')
+                to_hdr_bye = self._extract_header(request, 'To')
+                cseq_bye = self._extract_header(request, 'CSeq')
+                bye_resp = (
+                    "SIP/2.0 200 OK\r\n"
+                    f"Via: {via}\r\n"
+                    f"From: {from_hdr_bye}\r\n"
+                    f"To: {to_hdr_bye}\r\n"
+                    f"Call-ID: {call_id}\r\n"
+                    f"CSeq: {cseq_bye}\r\n"
+                    "Content-Length: 0\r\n"
+                    "\r\n"
+                )
+                self._send_response(bye_resp, addr)
+                await self._outbound_manager.on_bye_received(call_id)
+                # 🎙️ 아웃바운드 녹음 종료 (BYE 수신 경로는 일반 cleanup_terminated_call을 타지 않으므로 여기서 직접 처리)
+                _sip_rec = getattr(self._call_manager, 'sip_recorder', None) if self._call_manager else None
+                if _sip_rec and _sip_rec.is_recording(call_id):
+                    try:
+                        asyncio.create_task(_sip_rec.stop_recording(call_id))
+                        logger.info("outbound_recording_stopped_on_bye", call_id=call_id)
+                    except Exception as _rec_err:
+                        logger.error("outbound_recording_stop_error_on_bye",
+                                     call_id=call_id, error=str(_rec_err))
+                # RTP Worker 정리 (아웃바운드는 일반 BYE 경로를 타지 않으므로 여기서 직접 정리)
+                rtp_worker_ob = self._rtp_workers.pop(call_id, None)
+                if rtp_worker_ob:
+                    try:
+                        await rtp_worker_ob.stop()
+                    except Exception as _rtp_err:
+                        logger.warning("outbound_rtp_worker_stop_error",
+                                       call_id=call_id, error=str(_rtp_err))
+                try:
+                    self._port_pool.release_ports(call_id)
+                except Exception:
+                    pass
+                # 대시보드 해제
+                try:
+                    from src.api.routers.calls import unregister_active_call
+                    unregister_active_call(call_id)
+                except Exception:
+                    pass
+                if self._call_manager:
+                    self._call_manager.ai_enabled_calls.discard(call_id)
+                    try:
+                        from src.websocket import manager as ws_manager
+                        await ws_manager.emit_call_ended(call_id)
+                    except Exception:
+                        pass
+                self._active_calls.pop(call_id, None)
+                self._call_mapping.pop(call_id, None)
+                return
+            
+            # ★ Transfer 상태 체크 - 전환 중이면 TransferManager에 위임
+            if self._transfer_manager:
+                is_transfer_leg = call_info.get('is_transfer', False)
+                
+                if is_transfer_leg:
+                    # Transfer 레그에서 BYE (착신자가 끊음)
+                    logger.info("transfer_leg_bye", call_id=call_id)
+                    await self._transfer_manager.on_bye_received(call_id, initiator="callee")
+                elif self._transfer_manager.is_transfer_active(call_id):
+                    # 원래 호에서 BYE (발신자가 전환 중 끊음)
+                    logger.info("transfer_caller_bye", call_id=call_id)
+                    # 200 OK 먼저 보내기
+                    via = self._extract_header(request, 'Via')
+                    from_hdr_bye = self._extract_header(request, 'From')
+                    to_hdr_bye = self._extract_header(request, 'To')
+                    cseq_bye = self._extract_header(request, 'CSeq')
+                    bye_resp = (
+                        "SIP/2.0 200 OK\r\n"
+                        f"Via: {via}\r\n"
+                        f"From: {from_hdr_bye}\r\n"
+                        f"To: {to_hdr_bye}\r\n"
+                        f"Call-ID: {call_id}\r\n"
+                        f"CSeq: {cseq_bye}\r\n"
+                        "Content-Length: 0\r\n"
+                        "\r\n"
+                    )
+                    self._send_response(bye_resp, addr)
+                    await self._transfer_manager.on_bye_received(call_id, initiator="caller")
+                    await self._cleanup_call(call_id)
+                    return
+            
+            # ✅ AI 모드 체크
+            is_ai_mode = call_info.get('ai_mode_activated', False)
+            
+            # 200 OK 응답
+            via = self._extract_header(request, 'Via')
+            from_hdr = self._extract_header(request, 'From')
+            to_hdr = self._extract_header(request, 'To')
+            cseq = self._extract_header(request, 'CSeq')
+            
+            bye_response = (
+                "SIP/2.0 200 OK\r\n"
+                f"Via: {via}\r\n"
+                f"From: {from_hdr}\r\n"
+                f"To: {to_hdr}\r\n"
+                f"Call-ID: {call_id}\r\n"
+                f"CSeq: {cseq}\r\n"
+                "Content-Length: 0\r\n"
+                "\r\n"
+            )
+            self._send_response(bye_response, addr)
+            logger.info("bye_response_sent", call_id=call_id)
+            
+            # 원본 Call-ID 가져오기 (MediaSession cleanup용)
+            original_call_id = call_info.get('original_call_id', call_id)
+            
+            # ✅ AI 모드일 때는 상대방에게 BYE를 relay하지 않음
+            if is_ai_mode:
+                logger.info("bye_not_relayed_ai_mode",
+                           call_id=call_id,
+                           ai_mode=True)
+                
+                # AI 세션 정리만 수행
+                logger.info("bye_cleanup_triggered", 
+                           call_id=original_call_id,
+                           reason="BYE received in AI mode")
+                await self._cleanup_call(original_call_id)
+                return
+            
+            # 상대방을 결정 (From tag를 기반으로)
+            from_tag = self._extract_tag(from_hdr)
+            is_from_caller = (from_tag == call_info.get('caller_tag'))
+            
+            logger.debug("bye_source_check",
+                        call_id=call_id,
+                        is_from_caller=is_from_caller,
+                        caller_tag=call_info.get('caller_tag'),
+                        from_tag=from_tag)
+            
+            # 상대방에게 BYE 전달
+            if is_from_caller:
+                logger.debug("forwarding_bye", direction="caller_to_callee", callee=call_info['callee_username'])
+                # Caller가 BYE를 보냈으므로 Callee에게 전달
+                other_call_id = call_info['b2bua_call_id'] if call_id == original_call_id else original_call_id
+                other_addr = call_info['callee_addr']
+                other_username = call_info['callee_username']
+                # B2BUA가 Callee에게 보낸 INVITE의 From tag 사용
+                from_username = call_info['caller_username']
+                from_tag = call_info.get('b2bua_from_tag', 'b2bua')
+                to_tag = call_info.get('callee_tag', '')
+            else:
+                logger.debug("forwarding_bye", direction="callee_to_caller", caller=call_info['caller_username'])
+                # Callee가 BYE를 보냈으므로 Caller에게 전달
+                other_call_id = original_call_id if call_id == call_info['b2bua_call_id'] else call_info['b2bua_call_id']
+                other_addr = call_info['caller_addr']
+                other_username = call_info['caller_username']
+                # B2BUA가 Caller에게 보낸 응답의 To tag 사용 (원본 INVITE의 From tag)
+                from_username = call_info['callee_username']
+                from_tag = call_info.get('callee_tag', 'b2bua')
+                to_tag = call_info.get('caller_tag', '')
+            
+            # B2BUA IP 가져오기 (SDP c= 라인용)
+            b2bua_ip = self._get_b2bua_ip()
+            
+            to_tag_str = f";tag={to_tag}" if to_tag else ""
+            
+            bye_to_other = (
+                f"BYE sip:{other_username}@{other_addr[0]}:{other_addr[1]} SIP/2.0\r\n"
+                f"Via: SIP/2.0/UDP {b2bua_ip}:{self.config.sip.listen_port};branch=z9hG4bK{random.randint(100000, 999999)}\r\n"
+                f"From: <sip:{from_username}@{b2bua_ip}>;tag={from_tag}\r\n"
+                f"To: <sip:{other_username}@{b2bua_ip}>{to_tag_str}\r\n"
+                f"Call-ID: {other_call_id}\r\n"
+                "CSeq: 2 BYE\r\n"
+                "Max-Forwards: 70\r\n"
+                "Content-Length: 0\r\n"
+                "\r\n"
+            )
+            self._send_response(bye_to_other, other_addr)
+            logger.info("bye_forwarded",
+                       to=other_username,
+                       to_addr=f"{other_addr[0]}:{other_addr[1]}",
+                       other_call_id=other_call_id)
+            
+            # BYE Transaction Timer 시작
+            bye_transaction_id = f"bye-{other_call_id}"
+            call_info['bye_transaction_id'] = bye_transaction_id
+            
+            await self._transaction_timer.start_bye_transaction(
+                transaction_id=bye_transaction_id,
+                timeout_callback=lambda tid: asyncio.create_task(self._handle_bye_timeout(tid)),
+                timeout_seconds=self.config.sip.timers.bye_timeout
+            )
+            logger.info("bye_transaction_started",
+                       transaction_id=bye_transaction_id,
+                       timeout=self.config.sip.timers.bye_timeout)
+            
+            # ⭐ BYE 수신 측 cleanup (즉시 실행)
+            # BYE를 보낸 쪽은 이미 통화를 종료했으므로, 
+            # 우리도 즉시 세션을 정리해야 recording이 저장됨
+            logger.info("bye_cleanup_triggered", 
+                       call_id=original_call_id,
+                       reason="BYE received, initiating cleanup")
+            await self._cleanup_call(original_call_id)
+            
+        except Exception as e:
+            logger.error("bye_handling_error", error=str(e), exc_info=True)
+
+    async def send_bye_to_caller(self, call_id: str) -> bool:
+        """
+        서버에서 발신자(caller)에게 BYE를 보내 통화를 종료한다.
+        HITL timeout 등으로 AI가 통화를 끝낼 때 사용.
+        """
+        call_info = self._active_calls.get(call_id)
+        if not call_info:
+            logger.warning("send_bye_to_caller_no_call", call_id=call_id)
+            return False
+        caller_addr = call_info.get('caller_addr')
+        caller_username = call_info.get('caller_username')
+        caller_tag = call_info.get('caller_tag', '')
+        callee_tag = call_info.get('callee_tag', 'b2bua')
+        if not caller_addr or not caller_username:
+            logger.warning("send_bye_to_caller_missing_info", call_id=call_id)
+            return False
+        b2bua_ip = self._get_b2bua_ip()
+        to_tag_str = f";tag={caller_tag}" if caller_tag else ""
+        bye_msg = (
+            f"BYE sip:{caller_username}@{caller_addr[0]}:{caller_addr[1]} SIP/2.0\r\n"
+            f"Via: SIP/2.0/UDP {b2bua_ip}:{self.config.sip.listen_port};branch=z9hG4bK{random.randint(100000, 999999)}\r\n"
+            f"From: <sip:{call_info.get('callee_username', '')}@{b2bua_ip}>;tag={callee_tag}\r\n"
+            f"To: <sip:{caller_username}@{b2bua_ip}>{to_tag_str}\r\n"
+            f"Call-ID: {call_id}\r\n"
+            "CSeq: 2 BYE\r\n"
+            "Max-Forwards: 70\r\n"
+            "Content-Length: 0\r\n"
+            "\r\n"
+        )
+        self._send_response(bye_msg, caller_addr)
+        logger.info("bye_sent_to_caller", call_id=call_id, reason="server_initiated")
+        await self._cleanup_call(call_id)
+        return True
+
+    async def _preclear_callee_for_dock_transfer(self, call_id: str) -> None:
+        """Call Dock 돌려주기 직전: AI 파이프라인 중지 또는 인간 착신 레그 BYE."""
+        call_info = self._active_calls.get(call_id)
+        if not call_info:
+            logger.warning("dock_preclear_no_call", call_id=call_id)
+            return
+        if call_info.get("ai_mode_activated") and self._call_manager:
+            try:
+                cancelled = await self._call_manager.cancel_pipeline(call_id)
+                logger.info(
+                    "dock_preclear_ai_cancelled",
+                    call_id=call_id,
+                    cancelled=bool(cancelled),
+                    hypothesis="ai_pipeline_stopped_before_transfer_invite",
+                )
+            except Exception as e:
+                logger.warning("dock_preclear_ai_cancel_failed", call_id=call_id, error=str(e))
+            try:
+                self._call_manager.discard_ai_enabled_call(call_id)
+            except Exception as e:
+                logger.debug("dock_preclear_discard_ai_flag_failed", call_id=call_id, error=str(e))
+            return
+        await self._send_bye_to_callee_leg_server_initiated(call_id)
+
+    async def _send_bye_to_callee_leg_server_initiated(self, call_id: str) -> None:
+        """서버가 B2BUA→착신 다이얼로그에 BYE를 보낸다. 200 OK 시 전체 cleanup 대신 플래그로 callee 레그만 종료."""
+        call_info = self._active_calls.get(call_id)
+        if not call_info:
+            logger.warning("bye_to_callee_leg_no_call", call_id=call_id)
+            return
+        callee_addr = call_info.get("callee_addr")
+        callee_username = call_info.get("callee_username")
+        b2bua_call_id = call_info.get("b2bua_call_id")
+        b2bua_from_tag = call_info.get("b2bua_from_tag", "b2bua")
+        callee_tag = call_info.get("callee_tag") or ""
+        if not callee_addr or not callee_username or not b2bua_call_id:
+            logger.warning(
+                "bye_to_callee_leg_missing_fields",
+                call_id=call_id,
+                has_callee_addr=bool(callee_addr),
+                has_b2bua_call_id=bool(b2bua_call_id),
+            )
+            return
+        call_info["skip_full_cleanup_on_callee_bye_200"] = True
+        b2bua_ip = self._get_b2bua_ip()
+        from_user = call_info.get("caller_username") or "caller"
+        to_tag_str = f";tag={callee_tag}" if callee_tag else ""
+        bye_msg = (
+            f"BYE sip:{callee_username}@{callee_addr[0]}:{callee_addr[1]} SIP/2.0\r\n"
+            f"Via: SIP/2.0/UDP {b2bua_ip}:{self.config.sip.listen_port};branch=z9hG4bK{random.randint(100000, 999999)}\r\n"
+            f"From: <sip:{from_user}@{b2bua_ip}>;tag={b2bua_from_tag}\r\n"
+            f"To: <sip:{callee_username}@{b2bua_ip}>{to_tag_str}\r\n"
+            f"Call-ID: {b2bua_call_id}\r\n"
+            "CSeq: 2 BYE\r\n"
+            "Max-Forwards: 70\r\n"
+            "Content-Length: 0\r\n"
+            "\r\n"
+        )
+        self._send_response(bye_msg, callee_addr)
+        logger.info(
+            "dock_bye_sent_to_callee_leg",
+            call_id=call_id,
+            b2bua_call_id=b2bua_call_id,
+            hypothesis="await_200_ok_bye_partial_cleanup_flag_set",
+        )
+
+    def _forward_cancel_to_callee_leg(self, call_info: Dict[str, Any], *, reason: str) -> bool:
+        """B2BUA→착신 INVITE 트랜잭션이 진행 중이면 RFC 3261 §9.1에 맞춰 CANCEL을 착신에 전송한다.
+
+        발신 CANCEL 수신·no_answer AI 인수 직전 등에서 공용. 이미 200 OK로 응답된 세션에는 보내지 않는다.
+        Returns True if a CANCEL datagram was sent toward the callee.
+        """
+        if call_info.get("answer_time"):
+            logger.info(
+                "cancel_to_callee_skipped_already_answered",
+                reason=reason,
+                call_id=call_info.get("original_call_id") or call_info.get("b2bua_call_id"),
+            )
+            return False
+
+        callee_username = (
+            call_info.get("callee_username")
+            or call_info.get("callee")
+            or call_info.get("to_username")
+            or ""
+        )
+        b2bua_call_id = call_info.get("b2bua_call_id")
+        callee_addr = call_info.get("callee_addr_for_retransmit")
+        caller_username = call_info.get("caller_username") or ""
+
+        if not b2bua_call_id or not callee_addr or not callee_username:
+            logger.info(
+                "cancel_to_callee_skipped_no_outbound_invite",
+                reason=reason,
+                has_b2bua_call_id=bool(b2bua_call_id),
+                has_callee_addr=bool(callee_addr),
+                callee_username=callee_username or None,
+            )
+            return False
+
+        b2bua_ip = self._get_b2bua_ip()
+        listen_port = self.config.sip.listen_port
+        b2bua_cseq = call_info.get("b2bua_cseq", "1 INVITE")
+        cseq_number = str(b2bua_cseq).split()[0] if " " in str(b2bua_cseq) else "1"
+        b2bua_via = call_info.get(
+            "b2bua_via",
+            f"SIP/2.0/UDP {b2bua_ip}:{listen_port};branch=z9hG4bK-cancel",
+        )
+        b2bua_from = call_info.get(
+            "b2bua_from",
+            f"<sip:{caller_username}@{b2bua_ip}>;tag=b2bua",
+        )
+        b2bua_to = call_info.get(
+            "b2bua_to",
+            f"<sip:{callee_username}@{b2bua_ip}>",
+        )
+
+        cancel_msg = (
+            f"CANCEL sip:{callee_username}@{callee_addr[0]}:{callee_addr[1]} SIP/2.0\r\n"
+            f"Via: {b2bua_via}\r\n"
+            f"From: {b2bua_from}\r\n"
+            f"To: {b2bua_to}\r\n"
+            f"Call-ID: {b2bua_call_id}\r\n"
+            f"CSeq: {cseq_number} CANCEL\r\n"
+            f"Max-Forwards: 70\r\n"
+            f"Content-Length: 0\r\n"
+            "\r\n"
+        )
+        self._send_response(cancel_msg, callee_addr)
+        logger.info(
+            "b2bua_cancel_sent_to_callee",
+            reason=reason,
+            original_call_id=call_info.get("original_call_id"),
+            b2bua_call_id=b2bua_call_id,
+            callee=callee_username,
+            callee_addr=f"{callee_addr[0]}:{callee_addr[1]}",
+        )
+        return True
+    
+    async def _handle_cancel(self, request: str, addr: tuple) -> None:
+        """CANCEL 처리
+        
+        Args:
+            request: CANCEL 요청
+            addr: 송신자 주소
+        """
+        call_id = self._extract_header(request, 'Call-ID')
+        
+        logger.info("cancel_received", call_id=call_id, from_addr=f"{addr[0]}:{addr[1]}")
+        
+        # 200 OK 응답
+        via = self._extract_header(request, 'Via')
+        from_hdr = self._extract_header(request, 'From')
+        to_hdr = self._extract_header(request, 'To')
+        cseq = self._extract_header(request, 'CSeq')
+        
+        cancel_response = (
+            "SIP/2.0 200 OK\r\n"
+            f"Via: {via}\r\n"
+            f"From: {from_hdr}\r\n"
+            f"To: {to_hdr}\r\n"
+            f"Call-ID: {call_id}\r\n"
+            f"CSeq: {cseq}\r\n"
+            "Content-Length: 0\r\n"
+            "\r\n"
+        )
+        self._send_response(cancel_response, addr)
+        
+        if call_id not in self._active_calls:
+            logger.warning("cancel_active_call_not_found", call_id=call_id)
+            return
+
+        call_info = self._active_calls[call_id]
+        original_call_id = call_info.get("original_call_id", call_id)
+
+        await self._stop_ringback_player(original_call_id)
+
+        forwarded = self._forward_cancel_to_callee_leg(call_info, reason="caller_cancel")
+        if forwarded:
+            logger.info(
+                "caller_cancel_cleanup_deferred_until_487",
+                call_id=original_call_id,
+                note="착신에 CANCEL 전달됨 — 착신 487 수신 시 relay+cleanup",
+            )
+            return
+
+        asyncio.create_task(self._cleanup_call(original_call_id))
+    
+    async def _cleanup_call(self, call_id: str) -> None:
+        """통화 세션 정리
+        
+        Args:
+            call_id: 통화 ID (원본 Call-ID)
+        """
+        if call_id not in self._active_calls:
+            logger.debug("cleanup_call_already_cleaned", call_id=call_id)
+            return
+        
+        # ⭐ Race condition 방지: 즉시 _active_calls에서 제거
+        call_info = self._active_calls.pop(call_id)
+        new_call_id = call_info.get('b2bua_call_id')
+        
+        # ✅ B2BUA Call-ID도 제거
+        if new_call_id:
+            self._active_calls.pop(new_call_id, None)
+        
+        # ✅ 원본 Call-ID 확인 (RTP Worker, 녹음은 원본 Call-ID로 저장됨)
+        original_call_id = call_info.get('original_call_id', call_id)
+        
+        logger.info("cleanup_call_start", call_id=call_id, original_call_id=original_call_id, b2bua_call_id=new_call_id)
+
+        _ia_fb = call_info.get("immediate_ai_ack_fallback_task")
+        if _ia_fb and not _ia_fb.done():
+            _ia_fb.cancel()
+
+        # HITL Q&A(save_to_kb=false → 대기열)은 **Pipecat cancel 전에** 반드시 flush 한다.
+        # cancel_pipeline()이 파이프라인 finally에서 unregister_call()을 호출해
+        # _pending_kb_at_call_end를 비우면(또는 예전 순서에서는) 통화 종료 시 Chroma 적재가 영구 누락됨.
+        if self._call_manager:
+            try:
+                from src.common.sip_owner import normalize_owner_username
+                from src.services.hitl import get_hitl_service
+
+                callee_addr = call_info.get("callee_addr") or ("", "")
+                _cu = call_info.get("callee_username") or ""
+                to_uri = f"sip:{_cu}@{callee_addr[0]}" if _cu else ""
+                kb_owner = normalize_owner_username(to_uri) or normalize_owner_username(_cu) or None
+                _saved = await get_hitl_service().flush_hitl_kb_for_call(original_call_id, kb_owner)
+                if _saved:
+                    logger.info(
+                        "hitl_kb_flushed_on_cleanup call_id=%s saved=%s owner_set=%s",
+                        original_call_id,
+                        _saved,
+                        bool(kb_owner),
+                    )
+            except Exception as e:
+                logger.warning(
+                    "hitl_kb_flush_on_cleanup_failed call_id=%s error=%s",
+                    original_call_id,
+                    e,
+                )
+
+            # ⭐ BYE 수신 시 Pipecat Pipeline 즉시 취소 (LLM/TTS 계속 동작 방지)
+            try:
+                cancelled = await self._call_manager.cancel_pipeline(original_call_id)
+                if cancelled:
+                    logger.info("pipecat_pipeline_cancelled_on_bye", call_id=original_call_id)
+            except Exception as e:
+                logger.warning("pipecat_cancel_on_cleanup_error", call_id=original_call_id, error=str(e))
+            try:
+                self._call_manager.discard_ai_enabled_call(original_call_id)
+            except Exception as e:
+                logger.warning(
+                    "ai_enabled_discard_on_cleanup_error",
+                    call_id=original_call_id,
+                    error=str(e),
+                )
+
+        # 대시보드 실시간 통화: Repository에서 제거 (활성 목록에서 사라지도록)
+        if self.call_manager:
+            self.call_manager.remove_b2bua_call(original_call_id)
+        # WebSocket: B2BUA 통화 종료 이벤트 (대시보드에서 카드 제거)
+        try:
+            from src.websocket import manager as ws_manager
+            asyncio.create_task(ws_manager.emit_call_ended(original_call_id))
+        except Exception as e:
+            logger.warning("b2bua_call_ended_ws_failed", call_id=original_call_id, error=str(e))
+        
+        # 🎙️ 녹음 중지 (CDR 작성 전에 먼저 중지)
+        recording_metadata = None
+        sip_recorder = self._call_manager.sip_recorder if self._call_manager else None
+        if sip_recorder:
+            try:
+                # ✅ 원본 Call-ID로 녹음 중지
+                recording_metadata = await sip_recorder.stop_recording(original_call_id)
+                if recording_metadata:
+                    logger.info("recording_stopped",
+                               call_id=original_call_id,
+                               recording_file=recording_metadata.get('files', {}).get('mixed'),
+                               duration=recording_metadata.get('duration'))
+            except Exception as e:
+                logger.error("recording_stop_error", call_id=original_call_id, error=str(e))
+        
+        # Session Timer 취소 (✅ 원본 Call-ID로 취소)
+        session_cancelled = await self._session_timer.cancel_timer(original_call_id)
+        if session_cancelled:
+            logger.info("session_timer_cancelled", call_id=original_call_id)
+        else:
+            # AI 모드 등에서 session timer가 시작되지 않은 경우 정상적으로 없을 수 있음
+            logger.debug("session_timer_not_found", call_id=original_call_id)
+        
+        # Transaction Timers 취소
+        transaction_id = call_info.get('transaction_id')
+        bye_transaction_id = call_info.get('bye_transaction_id')
+        if transaction_id:
+            try:
+                await self._transaction_timer.terminate_transaction(transaction_id)
+            except Exception as e:
+                logger.warning("transaction_cleanup_error", 
+                             transaction_id=transaction_id,
+                             error=str(e))
+        if bye_transaction_id:
+            try:
+                await self._transaction_timer.terminate_transaction(bye_transaction_id)
+            except Exception as e:
+                logger.warning("bye_transaction_cleanup_error", 
+                             transaction_id=bye_transaction_id,
+                             error=str(e))
+        
+        # CDR 작성 (통화 이력 기록) — 항상 original_call_id 사용(대시보드·녹음·인사말과 일치)
+        try:
+            start_time = call_info.get('start_time', datetime.now())
+            end_time = datetime.now()
+            if isinstance(start_time, str):
+                try:
+                    start_time = datetime.fromisoformat(start_time)
+                except Exception:
+                    start_time = datetime.now()
+
+            duration_seconds = (end_time - start_time).total_seconds()
+            answer_time = call_info.get('answer_time')
+            setup_time = (answer_time - start_time).total_seconds() if (answer_time and start_time) else None
+
+            caller_addr = call_info.get('caller_addr')
+            callee_addr = call_info.get('callee_addr')
+            caller_ip = str(caller_addr[0]) if (caller_addr and len(caller_addr) > 0) else None
+            callee_ip = str(callee_addr[0]) if (callee_addr and len(callee_addr) > 0) else None
+            caller_uri = f"sip:{call_info.get('caller_username', 'unknown')}@{caller_ip or 'unknown'}"
+            callee_uri = f"sip:{call_info.get('callee_username', 'unknown')}@{callee_ip or 'unknown'}"
+
+            logger.info("cdr_flow_step_1_writing_cdr",
+                       call_id=original_call_id,
+                       caller=caller_uri,
+                       callee=callee_uri,
+                       duration=duration_seconds,
+                       message="[CDR Flow] Writing CDR from SIP Endpoint")
+
+            cdr = CDR(
+                call_id=original_call_id,
+                caller=caller_uri,
+                callee=callee_uri,
+                start_time=start_time,
+                answer_time=answer_time,
+                end_time=end_time,
+                duration=duration_seconds,
+                setup_time=setup_time,
+                termination_reason=TerminationReason.NORMAL,
+                caller_ip=caller_ip,
+                callee_ip=callee_ip,
+                has_recording=recording_metadata is not None,
+                recording_path=recording_metadata.get('files', {}).get('mixed') if recording_metadata else None,
+                recording_duration=recording_metadata.get('duration') if recording_metadata else None,
+                recording_type=recording_metadata.get('type') if recording_metadata else None,
+            )
+            # AI 인사말 Phase1/Phase2 (원본 call_id 기준으로 저장됨)
+            try:
+                from src.ai_voicebot.greeting_store import pop_greeting
+                greeting = pop_greeting(original_call_id)
+                if greeting.get("greeting_phase1"):
+                    cdr.metadata["greeting_phase1"] = greeting["greeting_phase1"]
+                if greeting.get("greeting_phase2"):
+                    cdr.metadata["greeting_phase2"] = greeting["greeting_phase2"]
+            except Exception:
+                pass
+            self._cdr_writer.write_cdr(cdr)
+
+            # 통화 이력 API(/api/call-history) · CID DB: CDR 파일과 별도로 call_records 동기화
+            try:
+                from src.common.call_record_db import upsert_call_record
+
+                _owner_ln = (
+                    call_info.get("callee_username")
+                    or call_info.get("callee")
+                    or ""
+                )
+                _caller_ln = call_info.get("caller_username") or ""
+                _callee_ln = call_info.get("callee_username") or ""
+                _st_iso = (
+                    start_time.isoformat()
+                    if hasattr(start_time, "isoformat")
+                    else str(start_time)
+                )
+                _ht = False
+                if isinstance(recording_metadata, dict):
+                    _ht = bool(recording_metadata.get("has_transcript"))
+                upsert_call_record(
+                    call_id=original_call_id,
+                    owner=_owner_ln,
+                    caller_id=_caller_ln,
+                    callee_id=_callee_ln,
+                    direction="inbound",
+                    start_time=_st_iso,
+                    end_time=end_time.isoformat(),
+                    duration=float(duration_seconds),
+                    has_recording=bool(recording_metadata),
+                    has_transcript=_ht,
+                )
+                logger.info(
+                    "call_record_upserted_on_sip_cleanup",
+                    call_id=original_call_id,
+                    owner=_owner_ln,
+                    caller_id=_caller_ln,
+                    callee_id=_callee_ln,
+                )
+            except Exception as _cre:
+                logger.warning(
+                    "call_record_upsert_on_cleanup_failed",
+                    call_id=original_call_id,
+                    error=str(_cre),
+                )
+            
+            cdr_path = self._cdr_writer.output_dir / datetime.now().strftime(self._cdr_writer.filename_pattern)
+            logger.info("cdr_flow_step_2_cdr_written_successfully",
+                       call_id=original_call_id,
+                       cdr_file=cdr_path.as_posix(),
+                       duration=duration_seconds,
+                       message="[CDR Flow] CDR written successfully")
+        
+        except Exception as e:
+            logger.error("cdr_flow_error_cdr_write_failed",
+                        call_id=original_call_id,
+                        error=str(e),
+                        message="[CDR Flow] CDR write error from SIP Endpoint",
+                        exc_info=True)
+        
+        # RTP Worker 정리 (✅ 원본 Call-ID로 찾기)
+        if original_call_id in self._rtp_workers:
+            rtp_worker = self._rtp_workers[original_call_id]
+            try:
+                # RTP Worker 중지 (async)
+                await rtp_worker.stop()
+                logger.debug("rtp_relay_stopped", call_id=original_call_id)
+            except Exception as e:
+                logger.error("rtp_worker_stop_error", call_id=original_call_id, error=str(e))
+            finally:
+                del self._rtp_workers[original_call_id]
+        
+        # Call mapping 삭제
+        if new_call_id:
+            self._call_mapping.pop(call_id, None)
+            self._call_mapping.pop(new_call_id, None)
+        
+        # ⭐ Active call은 이미 위에서 삭제됨 (중복 방지)
+        
+        # ✅ Knowledge Extraction 트리거 (CallManager에 위임)
+        # Human-to-human calls only; AI-to-caller calls are excluded.
+        if self._call_manager and recording_metadata:
+            try:
+                recording_dir_name = recording_metadata.get('directory')  # ✅ 'dir_name' → 'directory'
+                has_transcript = recording_metadata.get('has_transcript', False)  # ✅ transcript 존재 여부
+                # Authoritative: CallManager.ai_enabled_calls, then call_info flags (set on AI takeover / no-answer)
+                is_ai_call = (
+                    self._call_manager.is_ai_call(original_call_id)
+                    or call_info.get('ai_mode_activated', False)
+                    or call_info.get('is_ai_call', False)
+                )
+                
+                logger.debug("knowledge_extraction_check",
+                            call_id=original_call_id,
+                            has_recording_dir=bool(recording_dir_name),
+                            has_transcript=has_transcript,
+                            is_ai_call=is_ai_call,
+                            recording_dir=recording_dir_name)
+                
+                if recording_dir_name and has_transcript and not is_ai_call:
+                    # 일반 SIP 통화 + transcript 존재 시에만 Knowledge Extraction 수행
+                    await self._call_manager.trigger_knowledge_extraction(
+                        call_id=original_call_id,
+                        recording_dir_name=recording_dir_name,
+                        callee_username=call_info.get('callee_username', 'unknown')
+                    )
+                    logger.info("knowledge_extraction_triggered",
+                               call_id=original_call_id,
+                               recording_dir=recording_dir_name)
+                else:
+                    skip_reason = "no_recording_dir"
+                    if not recording_dir_name:
+                        skip_reason = "no_recording_dir"
+                    elif not has_transcript:
+                        skip_reason = "empty_transcript"
+                    elif is_ai_call:
+                        skip_reason = "ai_call"
+                    
+                    logger.info("knowledge_extraction_skipped",
+                               call_id=original_call_id,
+                               reason=skip_reason)
+            except Exception as e:
+                logger.error("knowledge_extraction_trigger_error",
+                            call_id=original_call_id,
+                            error=str(e),
+                            exc_info=True)
+        
+        logger.info("call_cleaned_up", call_id=call_id)
+    
+    def _extract_header(self, request: str, header_name: str) -> str:
+        """SIP 헤더 추출
+        
+        Args:
+            request: SIP 메시지
+            header_name: 헤더 이름
+            
+        Returns:
+            str: 헤더 값 (없으면 빈 문자열)
+        """
+        lines = request.split('\r\n')
+        header_lower = header_name.lower()
+        
+        for line in lines:
+            line_stripped = line.strip()
+            if not line_stripped:
+                continue
+            
+            # "Header-Name: value" 형식 체크
+            if ':' in line_stripped:
+                header_part, _, value_part = line_stripped.partition(':')
+                if header_part.strip().lower() == header_lower:
+                    return value_part.strip()
+        
+        # 헤더를 찾지 못한 경우 디버그 로그
+        logger.debug("header_not_found", header=header_name)
+        return ''
+    
+    def _create_options_response(self, request: str, addr: tuple) -> str:
+        """OPTIONS 응답 생성
+        
+        Args:
+            request: 요청 메시지
+            addr: 송신자 주소
+            
+        Returns:
+            str: 응답 메시지
+        """
+        via = self._extract_header(request, 'Via')
+        from_hdr = self._extract_header(request, 'From')
+        to_hdr = self._extract_header(request, 'To')
+        call_id = self._extract_header(request, 'Call-ID')
+        cseq = self._extract_header(request, 'CSeq')
+        
+        return (
+            "SIP/2.0 200 OK\r\n"
+            f"Via: {via}\r\n"
+            f"From: {from_hdr}\r\n"
+            f"To: {to_hdr}\r\n"
+            f"Call-ID: {call_id}\r\n"
+            f"CSeq: {cseq}\r\n"
+            "Allow: INVITE, ACK, CANCEL, OPTIONS, BYE, REGISTER, MESSAGE\r\n"
+            "Accept: application/sdp, text/plain\r\n"
+            "Content-Length: 0\r\n"
+            "\r\n"
+        )
+    
+    def _handle_register(self, request: str, addr: tuple) -> str:
+        """REGISTER 처리 및 사용자 등록
+        
+        Args:
+            request: 요청 메시지
+            addr: 송신자 주소
+            
+        Returns:
+            str: 응답 메시지
+        """
+        via = self._extract_header(request, 'Via')
+        from_hdr = self._extract_header(request, 'From')
+        to_hdr = self._extract_header(request, 'To')
+        call_id = self._extract_header(request, 'Call-ID')
+        cseq = self._extract_header(request, 'CSeq')
+        contact = self._extract_header(request, 'Contact')
+        expires = self._extract_header(request, 'Expires')
+        
+        # username 추출
+        username = self._extract_username(from_hdr)
+        
+        # 등록/해제 처리
+        if expires == '0':
+            # 등록 해제
+            if username in self._registered_users:
+                del self._registered_users[username]
+                logger.info("user_unregistered", username=username, addr=f"{addr[0]}:{addr[1]}")
+        else:
+            # 등록
+            self._registered_users[username] = {
+                'ip': addr[0],
+                'port': addr[1],
+                'contact': contact,
+                'from': from_hdr
+            }
+            logger.info("user_registered",
+                       username=username,
+                       addr=f"{addr[0]}:{addr[1]}",
+                       total_users=len(self._registered_users),
+                       registered_users=list(self._registered_users.keys()))
+        
+        # To 헤더에 tag가 없으면 추가
+        if 'tag=' not in to_hdr:
+            to_hdr += ';tag=mock-' + call_id[:8]
+        
+        return (
+            "SIP/2.0 200 OK\r\n"
+            f"Via: {via}\r\n"
+            f"From: {from_hdr}\r\n"
+            f"To: {to_hdr}\r\n"
+            f"Call-ID: {call_id}\r\n"
+            f"CSeq: {cseq}\r\n"
+            f"Contact: {contact}\r\n"
+            "Expires: 3600\r\n"
+            "Content-Length: 0\r\n"
+            "\r\n"
+        )
+
+    def _call_control_parse_forward_extension(self, forward_to: Optional[str]) -> Optional[str]:
+        """call-control `forward_to` 값을 등록 조회용 내선/사용자명으로 파싱."""
+        from src.call_control.forward_pick import parse_forward_extension
+
+        return parse_forward_extension(forward_to)
+
+    def _call_control_pick_group_destination(
+        self, members: Any, ring_mode: str
+    ) -> Optional[str]:
+        """그룹 멤버 중 등록된 내선 1명 선택. 동시/순차/순환(v1) 모두 «유휴 우선 → 등록만»."""
+        from src.call_control.forward_pick import pick_group_destination
+
+        return pick_group_destination(
+            members,
+            ring_mode,
+            registered_extensions=self._registered_users.keys(),
+            is_extension_busy=self._extension_has_active_call,
+        )
+
+    def _call_control_resolve_forward_target(
+        self, forward_to: Optional[str], *, rule_owner: str
+    ) -> Optional[Tuple[str, Tuple[str, int]]]:
+        if not forward_to or not str(forward_to).strip():
+            return None
+        s = str(forward_to).strip()
+        if s.lower().startswith("fwd:"):
+            from src.call_control.forward_resolve import resolve_fwd_ref_to_registered_extension
+
+            ext = resolve_fwd_ref_to_registered_extension(
+                s,
+                rule_owner=rule_owner,
+                registered_extensions=self._registered_users.keys(),
+                is_extension_busy=self._extension_has_active_call,
+            )
+            if not ext or ext not in self._registered_users:
+                return None
+            info = self._registered_users[ext]
+            return (ext, (info["ip"], info["port"]))
+
+        ext = self._call_control_parse_forward_extension(forward_to)
+        if not ext or ext not in self._registered_users:
+            return None
+        info = self._registered_users[ext]
+        return (ext, (info["ip"], info["port"]))
+
+    def _extension_has_active_call(self, extension: str) -> bool:
+        """내선이 다른 통화에 점유 중인지(링/응답/연결 등) 판단."""
+        terminal_states = {"terminated", "ended", "cancelled", "failed", "idle", ""}
+        seen_ids: set[int] = set()
+        for _cid, info in self._active_calls.items():
+            oid = id(info)
+            if oid in seen_ids:
+                continue
+            seen_ids.add(oid)
+            if info.get("callee_username") != extension and info.get("caller_username") != extension:
+                continue
+            st = str(info.get("state") or "").lower()
+            if st in terminal_states:
+                continue
+            logger.debug(
+                "extension_busy_detected",
+                extension=extension,
+                state=st,
+                call_id=info.get("original_call_id", _cid),
+            )
+            return True
+        return False
+
+    async def _handle_invite_b2bua(self, request: str, caller_addr: tuple) -> None:
+        """B2BUA INVITE 처리 (완전한 구현)
+        
+        Args:
+            request: INVITE 요청 메시지
+            caller_addr: 발신자 주소
+        """
+        try:
+            # 헤더 추출
+            via = self._extract_header(request, 'Via')
+            from_hdr = self._extract_header(request, 'From')
+            to_hdr = self._extract_header(request, 'To')
+            call_id = self._extract_header(request, 'Call-ID')
+            cseq = self._extract_header(request, 'CSeq')
+            contact = self._extract_header(request, 'Contact')
+            content_type = self._extract_header(request, 'Content-Type')
+            
+            # SDP 추출
+            sdp = self._extract_sdp_body(request)
+            
+            # 발신자와 수신자 username 추출
+            caller_username = self._extract_username(from_hdr)
+            callee_username = self._extract_username(to_hdr)
+            # From 이 비어 있거나 파싱 실패 시 P-Asserted-Identity 등 (게이트웨이·캐리어가 넣는 경우)
+            if not (caller_username or "").strip():
+                for _id_hdr in (
+                    "P-Asserted-Identity",
+                    "P-Preferred-Identity",
+                    "Remote-Party-ID",
+                ):
+                    _alt = self._extract_header(request, _id_hdr)
+                    if not _alt:
+                        continue
+                    # 여러 URI가 있으면 첫 줄만
+                    _first = _alt.split(",")[0].strip()
+                    _u = self._extract_username(_first)
+                    if (_u or "").strip():
+                        caller_username = _u.strip()
+                        logger.info(
+                            "b2bua_caller_from_identity_header",
+                            header=_id_hdr,
+                            user=caller_username,
+                            call_id=call_id,
+                        )
+                        break
+            if not (caller_username or "").strip():
+                logger.warning(
+                    "b2bua_invite_caller_empty",
+                    call_id=call_id,
+                    from_preview=(from_hdr or "")[:120],
+                )
+            
+            # From tag 추출
+            caller_tag = self._extract_tag(from_hdr)
+            
+            logger.info("b2bua_invite_received",
+                       caller=caller_username,
+                       callee=callee_username,
+                       call_id=call_id)
+            
+            # ✅ 중복 INVITE 체크 (재전송 방지)
+            if call_id in self._active_calls:
+                existing_call = self._active_calls[call_id]
+                state = existing_call.get('state', 'unknown')
+                
+                logger.info("invite_retransmission_detected",
+                           call_id=call_id,
+                           state=state,
+                           caller=caller_username,
+                           callee=callee_username)
+                
+                # 이미 처리 중이면 100 Trying 재전송 (멱등성)
+                if state == 'inviting':
+                    trying_response = (
+                        "SIP/2.0 100 Trying\r\n"
+                        f"Via: {via}\r\n"
+                        f"From: {from_hdr}\r\n"
+                        f"To: {to_hdr}\r\n"
+                        f"Call-ID: {call_id}\r\n"
+                        f"CSeq: {cseq}\r\n"
+                        "Content-Length: 0\r\n"
+                        "\r\n"
+                    )
+                    self._send_response(trying_response, caller_addr)
+                
+                # 중복 요청은 더 이상 처리하지 않음
+                return
+            
+            # 수신자가 등록되어 있는지 확인
+            if callee_username not in self._registered_users:
+                logger.warning("callee_not_found", callee=callee_username, caller=caller_username)
+                
+                response = (
+                    "SIP/2.0 404 Not Found\r\n"
+                    f"Via: {via}\r\n"
+                    f"From: {from_hdr}\r\n"
+                    f"To: {to_hdr};tag=b2bua-{random.randint(1000, 9999)}\r\n"
+                    f"Call-ID: {call_id}\r\n"
+                    f"CSeq: {cseq}\r\n"
+                    "Content-Length: 0\r\n"
+                    "\r\n"
+                )
+                self._send_response(response, caller_addr)
+                return
+            
+            # 수신자 정보 가져오기
+            callee_info = self._registered_users[callee_username]
+            callee_addr = (callee_info['ip'], callee_info['port'])
+            
+            logger.debug("callee_found",
+                        callee=callee_username,
+                        addr=f"{callee_addr[0]}:{callee_addr[1]}",
+                        call_id=call_id)
+            
+            # ------------------------------------------------------------------
+            # 착신 라우팅 결정 (Call Control Rules 우선, 없으면 operator_status fallback)
+            # 우선순위: 발신자 필터(VIP/차단) > 시간 스케줄 규칙 > operator_status > 기본 직접 연결
+            # ------------------------------------------------------------------
+            from src.call_control import routing_engine as _routing_engine
+            from src.call_control.models import RoutingAction
+            from src.sip_core.operator_status import get_operator_status_manager
+
+            # 1단계: 발신자 필터 체크 (VIP/차단 등)
+            _caller_filter = _routing_engine.resolve_caller_filter(callee_username, caller_username or "")
+            if _caller_filter:
+                logger.info(
+                    "call_control_caller_filter_matched",
+                    call_id=call_id,
+                    callee=callee_username,
+                    caller=caller_username,
+                    filter_id=_caller_filter.get("id"),
+                    action=_caller_filter.get("action"),
+                )
+                _routing_result = {"rule": _caller_filter, "schedule": None, "is_schedule_active": True}
+            else:
+                # 2단계: 시간 스케줄 기반 규칙
+                _routing_result = _routing_engine.resolve_rule(callee_username)
+
+            _routing_action: str = "direct"
+            _effective_no_answer_timeout: int = self.config.sip.timers.no_answer_timeout
+            _forward_to: str | None = None
+
+            if _routing_result:
+                _rule = _routing_result["rule"]
+                _invite_callee_before_forward = callee_username
+                _routing_action = _rule.get("action", "direct")
+                _effective_no_answer_timeout = _rule.get("no_answer_timeout", _effective_no_answer_timeout)
+                _forward_to = _rule.get("forward_to")
+                logger.info(
+                    "call_control_rule_resolved",
+                    call_id=call_id,
+                    callee=callee_username,
+                    action=_routing_action,
+                    rule_id=_rule.get("id"),
+                    schedule_id=_rule.get("schedule_id"),
+                    no_answer_timeout=_effective_no_answer_timeout,
+                )
+                # busy_ai / 무조건·통화중 착신전환 → 실제 INVITE 대상(callee) 및 AI 경로 조정
+                _rule_action = str(_rule.get("action", "direct"))
+                if _rule_action == "busy_ai":
+                    if self._extension_has_active_call(callee_username):
+                        _routing_action = RoutingAction.IMMEDIATE_AI.value
+                        logger.info(
+                            "call_control_busy_ai_to_immediate_ai",
+                            call_id=call_id,
+                            callee=callee_username,
+                            note="착신자 통화 중 — 즉시 AI 경로",
+                        )
+                if _rule_action in ("forward_always", "forward"):
+                    _tgt = self._call_control_resolve_forward_target(
+                        _forward_to, rule_owner=_invite_callee_before_forward
+                    )
+                    if _tgt:
+                        callee_username, callee_addr = _tgt[0], _tgt[1]
+                        callee_info = self._registered_users[callee_username]
+                        logger.info(
+                            "call_control_forward_always_applied",
+                            call_id=call_id,
+                            target=callee_username,
+                        )
+                    else:
+                        logger.warning(
+                            "call_control_forward_always_unresolved",
+                            call_id=call_id,
+                            forward_to=_forward_to,
+                        )
+                elif _rule_action == "forward_when_busy":
+                    if self._extension_has_active_call(callee_username):
+                        _tgt = self._call_control_resolve_forward_target(
+                            _forward_to, rule_owner=_invite_callee_before_forward
+                        )
+                        if _tgt:
+                            callee_username, callee_addr = _tgt[0], _tgt[1]
+                            callee_info = self._registered_users[callee_username]
+                            logger.info(
+                                "call_control_forward_when_busy_applied",
+                                call_id=call_id,
+                                original=_invite_callee_before_forward,
+                                target=callee_username,
+                            )
+                        else:
+                            logger.warning(
+                                "call_control_forward_when_busy_unresolved",
+                                call_id=call_id,
+                                forward_to=_forward_to,
+                            )
+            else:
+                # Call Control 규칙 없음 → 기존 operator_status(away mode) 폴백
+                status_manager = get_operator_status_manager()
+                if status_manager.is_away(callee_username):
+                    _routing_action = RoutingAction.IMMEDIATE_AI.value
+                    away_message = status_manager.get_away_message(callee_username)
+                    logger.info(
+                        "call_control_fallback_to_operator_away",
+                        call_id=call_id,
+                        callee=callee_username,
+                        away_message=away_message,
+                        note="Call Control 규칙 없음 — operator_status away 폴백",
+                    )
+                else:
+                    logger.debug(
+                        "call_control_no_rule_direct",
+                        call_id=call_id,
+                        callee=callee_username,
+                        note="Call Control 규칙 없음 — 기본 직접 연결",
+                    )
+
+            # Enum 혼용 방지 — 문자열로 통일
+            if isinstance(_routing_action, RoutingAction):
+                _routing_action = _routing_action.value
+            else:
+                _routing_action = str(_routing_action or "direct")
+
+            # away 여부는 이제 _routing_action 으로 판단
+            _is_away_call = _routing_action == RoutingAction.IMMEDIATE_AI.value
+
+            # 안내멘트 조회 (규칙에 announcement_id가 있을 때)
+            _announcement_text: str | None = None
+            if _routing_result and _routing_result["rule"].get("announcement_id"):
+                try:
+                    from src.call_control import db as _cc_db
+                    _ann = _cc_db.get_announcement(_routing_result["rule"]["announcement_id"])
+                    if _ann and _ann.get("text"):
+                        _announcement_text = _ann["text"]
+                        call_info["routing_announcement_text"] = _announcement_text
+                        logger.debug(
+                            "call_control_announcement_loaded",
+                            call_id=call_id,
+                            announcement_id=_routing_result["rule"]["announcement_id"],
+                        )
+                except Exception as _ann_err:
+                    logger.warning("call_control_announcement_load_error", error=str(_ann_err))
+            
+            # 새로운 Call-ID 생성 (B2BUA leg)
+            new_call_id = f"b2bua-{random.randint(100000, 999999)}-{call_id[:8]}"
+            new_tag = f"b2bua-{random.randint(1000, 9999)}"
+            
+            # Extract original Via branch (매우 중요 - ACK를 받기 위해 필요!)
+            via_branch = None
+            via_match = re.search(r'branch=([^;,\s]+)', via)
+            if via_match:
+                via_branch = via_match.group(1)
+            
+            # ✅ Via 헤더 전체도 저장 (200 OK 응답용)
+            original_via = via.strip()
+            
+            # Call mapping 저장
+            self._call_mapping[call_id] = new_call_id
+            self._call_mapping[new_call_id] = call_id  # 양방향
+            
+            # Active call 정보 저장
+            call_info = {
+                'original_call_id': call_id,  # 원본 Call-ID (cleanup용)
+                'caller_username': caller_username,
+                'callee_username': callee_username,
+                'caller_addr': caller_addr,
+                'callee_addr': callee_addr,
+                'caller_tag': caller_tag,
+                'callee_tag': None,  # 나중에 200 OK에서 설정
+                'b2bua_from_tag': new_tag,  # B2BUA가 callee에게 보낸 INVITE의 From tag
+                'b2bua_call_id': new_call_id,
+                'original_from': from_hdr,
+                'original_to': to_hdr,
+                'original_via': original_via,  # ✅ Via 헤더 전체 (200 OK 응답용)
+                'original_via_branch': via_branch,  # ACK 수신을 위해 필수!
+                'original_cseq': cseq,  # ✅ 원본 INVITE의 CSeq 저장 (RFC 3261 준수)
+                'sdp': sdp,
+                'state': 'inviting',
+                'start_time': datetime.now(),  # CDR용 통화 시작 시간
+                'answer_time': None,  # 200 OK 시점에 설정
+                # 발신 INVITE에 대해 B2BUA가 AI 인수용 200 OK+SDP를 보냈는지 (immediate_ai·무응답 AI 공용)
+                'caller_200_ok_sent': False,
+                # away 모드이면 INVITE를 포워딩하더라도 ACK 수신 시 AI 경로를 타야 함
+                'ai_mode_activated': _is_away_call,
+                'is_ai_call': _is_away_call,
+                # Call Control 라우팅 정보
+                'routing_action': _routing_action,
+                'routing_forward_to': _forward_to,
+            }
+            self._active_calls[call_id] = call_info
+            # B2BUA Call-ID로도 접근 가능하도록
+            self._active_calls[new_call_id] = call_info
+
+            # away 모드: handle_no_answer_timeout은 _start_rtp_relay(Early Bind) 이후에 호출
+            # (RTP Worker가 등록된 후에야 pipecat_builder가 worker를 찾을 수 있음)
+
+            # 대시보드 실시간 통화 목록: CallManager Repository에 등록 (GET /api/calls/active)
+            if self.call_manager:
+                from_uri = f"sip:{caller_username}@{caller_addr[0]}"
+                to_uri = f"sip:{callee_username}@{callee_addr[0]}"
+                self.call_manager.register_b2bua_call(call_id, from_uri, to_uri)
+            
+            # 대시보드: INVITE 수신 직후부터 실시간 통화·대화 패널에 표시 (200 OK 전)
+            try:
+                from src.websocket import manager as ws_manager
+
+                _inv_from = f"sip:{caller_username}@{caller_addr[0]}"
+                _inv_to = f"sip:{callee_username}@{callee_addr[0]}"
+                _inv_now = datetime.now().isoformat()
+                logger.info(
+                    "b2bua_ws_emit_call_started_scheduled",
+                    call_id=call_id,
+                    caller=_inv_from,
+                    callee=_inv_to,
+                    sip_phase="inviting",
+                    note="GlobalCallDock·대시보드용 Socket.IO 브로드캐스트 예약",
+                )
+                asyncio.create_task(
+                    ws_manager.emit_call_started(
+                        call_id,
+                        {
+                            "caller": _inv_from,
+                            "callee": _inv_to,
+                            "is_ai_handled": False,
+                            "status": "착신 시도 중 (INVITE)",
+                            "sip_phase": "inviting",
+                            "timestamp": _inv_now,
+                            "started_at": _inv_now,
+                        },
+                    )
+                )
+            except Exception as _ws_inv:
+                logger.warning(
+                    "b2bua_invite_call_started_ws_failed",
+                    call_id=call_id,
+                    error=str(_ws_inv),
+                )
+            
+            logger.info("b2bua_call_setup",
+                       caller=caller_username,
+                       callee=callee_username,
+                       original_call_id=call_id,
+                       new_call_id=new_call_id)
+            
+            logger.debug("creating_b2bua_leg", new_call_id=new_call_id, original_call_id=call_id)
+            
+            # 📡 MediaSession 생성 및 포트 할당
+            logger.debug("creating_media_session", call_id=call_id, sdp_exists=sdp is not None)
+            if sdp:
+                logger.debug("sdp_info",
+                           call_id=call_id,
+                           sdp_length=len(sdp),
+                           sdp_preview=sdp)
+            
+            media_session = self.media_session_manager.create_session(
+                call_id=call_id,
+                caller_sdp=sdp,
+                mode=None  # 기본 모드 사용
+            )
+            media_session.caller_identity = (caller_username or "").strip()
+            media_session.callee_identity = (callee_username or "").strip()
+            
+            logger.info("media_session_created",
+                       call_id=call_id,
+                       caller_audio_port=media_session.caller_leg.get_audio_rtp_port(),
+                       callee_audio_port=media_session.callee_leg.get_audio_rtp_port(),
+                       caller_original_ip=media_session.caller_leg.original_ip,
+                       caller_original_port=media_session.caller_leg.original_audio_port,
+                       caller_allocated_ports=media_session.caller_leg.allocated_ports,
+                       callee_allocated_ports=media_session.callee_leg.allocated_ports)
+            
+            # 발신자에게 100 Trying 전송
+            trying_response = (
+                "SIP/2.0 100 Trying\r\n"
+                f"Via: {via}\r\n"
+                f"From: {from_hdr}\r\n"
+                f"To: {to_hdr}\r\n"
+                f"Call-ID: {call_id}\r\n"
+                f"CSeq: {cseq}\r\n"
+                "Content-Length: 0\r\n"
+                "\r\n"
+            )
+            self._send_response(trying_response, caller_addr)
+            
+            # 수신자에게 INVITE 전달
+            # 실제 IP 가져오기 (0.0.0.0이면 네트워크 인터페이스 IP 사용)
+            b2bua_ip = self.config.sip.listen_ip
+            if b2bua_ip == "0.0.0.0":
+                # Callee 주소로부터 적절한 IP 추론
+                b2bua_ip = callee_addr[0].split('.')[0:3]  # 같은 네트워크 추정
+                b2bua_ip = '.'.join(b2bua_ip) + '.233'  # 임시로 .233 사용
+                # 더 나은 방법: socket.gethostbyname(socket.gethostname())
+                import socket
+                try:
+                    b2bua_ip = socket.gethostbyname(socket.gethostname())
+                except:
+                    b2bua_ip = "127.0.0.1"
+            
+            new_via = f"SIP/2.0/UDP {b2bua_ip}:{self.config.sip.listen_port};branch=z9hG4bK{random.randint(100000, 999999)}"
+            new_from = f"<sip:{caller_username}@{b2bua_ip}>;tag={new_tag}"
+            new_to = f"<sip:{callee_username}@{b2bua_ip}>"
+            new_contact = f"<sip:{caller_username}@{b2bua_ip}:{self.config.sip.listen_port}>"
+            
+            # ✅ B2BUA가 callee에게 보내는 INVITE 정보를 call_info에 저장 (CANCEL용)
+            call_info['b2bua_via'] = new_via
+            call_info['b2bua_from'] = new_from
+            call_info['b2bua_to'] = new_to
+            call_info['b2bua_cseq'] = "1 INVITE"  # B2BUA → Callee INVITE의 CSeq
+            
+            # 📝 SDP Rewrite - B2BUA IP/Port로 교체
+            content_type_header = ""
+            content_length_header = ""
+            invite_body = ""
+            
+            if sdp:
+                # Direct 모드: SDP 그대로 전달 (단말간 직접 RTP 통신)
+                if media_session.mode == MediaMode.DIRECT:
+                    rewritten_sdp = sdp
+                    logger.info("invite_sdp_direct_mode", call_id=call_id)
+                else:
+                    # Bypass/Reflecting 모드: SDP 수정 (B2BUA가 RTP 중계)
+                    logger.debug("rewriting_sdp",
+                               call_id=call_id,
+                               b2bua_ip=b2bua_ip,
+                               callee_audio_port=media_session.callee_leg.get_audio_rtp_port())
+                    
+                    # 🐛 DEBUG: 원본 SDP 확인
+                    logger.info("sdp_rewrite_original", 
+                               call_id=call_id,
+                               original_length=len(sdp),
+                               original_lines=len(sdp.split('\n')),
+                               has_rtcp_fb=("rtcp-fb" in sdp))
+                    
+                    # 1. 벤더 특정 속성 제거 (a=X-* 등)
+                    rewritten_sdp = SDPManipulator.remove_vendor_attributes(sdp)
+                    logger.info("sdp_after_vendor_removal",
+                               call_id=call_id,
+                               length=len(rewritten_sdp),
+                               has_rtcp_fb=("rtcp-fb" in rewritten_sdp))
+                    
+                    # 2. Origin IP를 B2BUA IP로 교체 (o= 라인)
+                    rewritten_sdp = SDPManipulator.replace_origin_ip(rewritten_sdp, b2bua_ip)
+                    logger.info("sdp_after_origin_replacement",
+                               call_id=call_id,
+                               length=len(rewritten_sdp),
+                               has_rtcp_fb=("rtcp-fb" in rewritten_sdp))
+                    
+                    # 3. Connection IP를 B2BUA IP로 교체 (c= 라인)
+                    rewritten_sdp = SDPManipulator.replace_connection_ip(rewritten_sdp, b2bua_ip)
+                    logger.info("sdp_after_connection_replacement",
+                               call_id=call_id,
+                               length=len(rewritten_sdp),
+                               has_rtcp_fb=("rtcp-fb" in rewritten_sdp))
+                    
+                    # 4. Audio 포트를 Callee Leg 할당 포트로 교체
+                    callee_audio_port = media_session.callee_leg.get_audio_rtp_port()
+                    callee_audio_rtcp_port = media_session.callee_leg.get_audio_rtcp_port()
+                    
+                    if callee_audio_port:
+                        rewritten_sdp = SDPManipulator.replace_media_port(rewritten_sdp, "audio", callee_audio_port)
+                        logger.info("sdp_after_media_port_replacement",
+                                   call_id=call_id,
+                                   length=len(rewritten_sdp),
+                                   has_rtcp_fb=("rtcp-fb" in rewritten_sdp),
+                                   o=b2bua_ip,
+                                   c=b2bua_ip,
+                                   m_audio=callee_audio_port)
+                    
+                    # 5. RTCP 포트를 SHORT FORMAT으로 변경 (원본 SDP에 a=rtcp:가 있는 경우만)
+                    if callee_audio_rtcp_port and SDPManipulator.has_rtcp_attribute(sdp, "audio"):
+                        rewritten_sdp = SDPManipulator.replace_rtcp_attribute(rewritten_sdp, "audio", callee_audio_rtcp_port, b2bua_ip)
+                        logger.info("sdp_after_rtcp_replacement",
+                                   call_id=call_id,
+                                   length=len(rewritten_sdp),
+                                   has_rtcp_fb=("rtcp-fb" in rewritten_sdp),
+                                   rtcp_port=callee_audio_rtcp_port)
+                    
+                    # TODO: Video 지원 시 video 포트도 교체
+                
+                content_type_header = f"Content-Type: application/sdp\r\n"
+                content_length_header = f"Content-Length: {len(rewritten_sdp)}\r\n"
+                invite_body = f"\r\n{rewritten_sdp}"
+            else:
+                content_length_header = "Content-Length: 0\r\n"
+            
+            invite_to_callee = (
+                f"INVITE sip:{callee_username}@{callee_addr[0]}:{callee_addr[1]} SIP/2.0\r\n"
+                f"Via: {new_via}\r\n"
+                f"From: {new_from}\r\n"
+                f"To: {new_to}\r\n"
+                f"Call-ID: {new_call_id}\r\n"
+                f"CSeq: 1 INVITE\r\n"
+                f"Contact: {new_contact}\r\n"
+                "Max-Forwards: 70\r\n"
+                "User-Agent: SIP-PBX-B2BUA/1.0\r\n"
+                f"{content_type_header}"
+                f"{content_length_header}"
+                f"{invite_body}"
+            )
+            
+            if _is_away_call:
+                # away 모드: 착신자에게 INVITE를 보내지 않고 즉시 RTP 바인딩 후 AI 응대
+                logger.info("away_mode_skip_invite_to_callee",
+                            call_id=call_id,
+                            callee=callee_username,
+                            note="callee away — B2BUA INVITE 전송 생략, AI 응대 직행")
+            else:
+                logger.debug("forwarding_invite_to_callee",
+                            call_id=call_id,
+                            callee=callee_username,
+                            callee_addr=f"{callee_addr[0]}:{callee_addr[1]}")
+                self._send_response(invite_to_callee, callee_addr)
+
+                # Transaction Timer 시작 (INVITE 재전송 및 타임아웃)
+                transaction_id = f"invite-{new_call_id}"
+                call_info['transaction_id'] = transaction_id
+                call_info['invite_message'] = invite_to_callee  # 재전송용
+                call_info['callee_addr_for_retransmit'] = callee_addr  # 재전송 대상
+
+                await self._transaction_timer.start_invite_transaction(
+                    transaction_id=transaction_id,
+                    retransmit_callback=lambda tid: self._retransmit_invite(tid),
+                    timeout_callback=lambda tid: asyncio.create_task(self._handle_invite_timeout(tid))
+                )
+
+                logger.info("invite_transaction_started",
+                           transaction_id=transaction_id,
+                           call_id=call_id,
+                           new_call_id=new_call_id)
+
+                # no_answer_timeout 타이머 시작 (AI 응대 모드용)
+                # _effective_no_answer_timeout: Call Control 규칙에서 결정된 값
+                _nat = _effective_no_answer_timeout if _routing_action == RoutingAction.NO_ANSWER_AI.value else self.config.sip.timers.no_answer_timeout
+                if _nat > 0:
+                    async def delayed_no_answer_check():
+                        await asyncio.sleep(_nat)
+                        await self._handle_no_answer_timeout(call_id)
+
+                    no_answer_task = asyncio.create_task(delayed_no_answer_check())
+                    call_info['no_answer_timer'] = no_answer_task
+
+                    logger.info("no_answer_timer_started",
+                               call_id=call_id,
+                               timeout=_nat,
+                               source="call_control" if _routing_result else "config")
+
+            # 🚀 Early Bind: RTP 소켓 bind (away 모드에서도 동일하게 실행)
+            logger.info("early_bind_starting", call_id=call_id, action="before_200_ok")
+            rtp_bind_success = await self._start_rtp_relay(call_id)
+            if rtp_bind_success:
+                logger.info("early_bind_success", call_id=call_id)
+            else:
+                logger.warning("early_bind_failed", call_id=call_id)
+
+            # 🎵 Ringback Player: 인사말+통화연결음 early media (away 모드 제외)
+            if rtp_bind_success and not _is_away_call:
+                # 링백·스케줄 할당은 착신 내선(owner) 기준 — 전역 config.owner(pbx)와 혼동 방지
+                await self._start_ringback_player(call_id, owner=callee_username)
+
+            if _is_away_call:
+                # immediate_ai: 착신 INVITE 없음 → 발신자에게 직접 200 OK+SDP 후 ACK에서 인사 이벤트 set
+                # (_start_rtp_relay로 _rtp_workers에 등록된 후에야 RTP/AI 바인딩 가능)
+                if self.call_manager:
+                    sent = await self._ai_takeover_send_200_ok_to_caller(
+                        call_id,
+                        stop_ringback=False,
+                        send_cancel_to_callee=False,
+                    )
+                    if not sent:
+                        logger.error(
+                            "immediate_ai_200_ok_failed",
+                            call_id=call_id,
+                            callee=callee_username,
+                            note="발신자 200 OK 미전송 — RTP/주소 확인",
+                        )
+                    await self.call_manager.handle_no_answer_timeout(
+                        call_id,
+                        callee_username,
+                        greeting_override=_announcement_text,
+                    )
+                    logger.info(
+                        "ai_mode_activated_by_call_control",
+                        call_id=call_id,
+                        callee=callee_username,
+                        has_announcement=bool(_announcement_text),
+                        caller_200_ok_sent=bool(sent),
+                        note="immediate_ai: 200 OK 후 Pipecat 기동 — ACK에서 notify_call_established",
+                    )
+
+                async def _immediate_ai_ack_fallback() -> None:
+                    try:
+                        await asyncio.sleep(5.0)
+                    except asyncio.CancelledError:
+                        return
+                    ci = self._active_calls.get(call_id)
+                    if not ci or not self.call_manager:
+                        return
+                    if ci.get("immediate_ai_ack_fallback_done"):
+                        return
+                    if ci.get("state") == "established":
+                        return
+                    logger.warning(
+                        "immediate_ai_no_ack_fallback_notify",
+                        call_id=call_id,
+                        note="ACK 5s 미수신 — 인사말 대기 이벤트 강제 set",
+                    )
+                    ci["immediate_ai_ack_fallback_done"] = True
+                    ci["state"] = "established"
+                    self.call_manager.notify_call_established(call_id)
+
+                if self.call_manager:
+                    _fb = asyncio.create_task(_immediate_ai_ack_fallback())
+                    call_info["immediate_ai_ack_fallback_task"] = _fb
+
+            _log_no_answer_timeout = _effective_no_answer_timeout if not _is_away_call else 0
+            logger.info("b2bua_call_setup_in_progress",
+                       call_id=call_id,
+                       transaction_timeout=f"{64 * self.config.sip.timers.t1}s",
+                       no_answer_timeout=f"{_log_no_answer_timeout}s" if _log_no_answer_timeout > 0 else None)
+            
+        except Exception as e:
+            logger.error("b2bua_invite_error", error=str(e), exc_info=True)
+
+    @staticmethod
+    def _sip_message_inbound_txn_key(call_id: str, cseq: str) -> str:
+        c = (call_id or "").strip()
+        q = (cseq or "").strip()
+        if not c:
+            return ""
+        return f"{c.lower()}|{q.lower()}"
+
+    def _prune_inbound_message_seen(self, now: float) -> None:
+        ttl = float(self._inbound_message_seen_ttl_sec or 64.0)
+        if not self._inbound_message_seen:
+            return
+        stale = [k for k, t in self._inbound_message_seen.items() if now - t > ttl]
+        for k in stale[:512]:
+            self._inbound_message_seen.pop(k, None)
+
+    def _sip_message_inbound_try_claim(self, txn_key: str) -> bool:
+        """True = 첫 처리(계속), False = 재전송·중복(200 OK 만 보내고 끝)."""
+        if not txn_key:
+            return True
+        now = time.monotonic()
+        with self._inbound_message_seen_lock:
+            self._prune_inbound_message_seen(now)
+            if txn_key in self._inbound_message_seen:
+                return False
+            self._inbound_message_seen[txn_key] = now
+            return True
+    
+    async def _handle_sip_message_method(self, data: bytes, addr: tuple) -> None:
+        """SIP MESSAGE 메서드 처리 (RFC 3428 — 인스턴트 메시지 / SMS 테스트용)
+
+        Linphone 등 소프트폰에서 전송한 SIP MESSAGE를 수신하여:
+          1. 200 OK 응답 반환
+          2. (채팅용 텍스트만) WebSocket·chat_messages 반영 — isComposing/CPIM 바깥 등은 제외
+          3. 내선 간 릴레이는 원본 본문 바이트 보존 디코드로 유지
+
+        Args:
+            data: SIP MESSAGE UDP datagram (raw bytes)
+            addr: 송신자 주소 (ip, port)
+        """
+        try:
+            from src.sip_core.sip_message_inbound import (
+                normalize_inbound_message_for_chat,
+                split_sip_headers_and_body,
+            )
+
+            headers_text, body_bytes = split_sip_headers_and_body(data)
+            via = self._extract_header(headers_text, 'Via')
+            from_hdr = self._extract_header(headers_text, 'From')
+            to_hdr = self._extract_header(headers_text, 'To')
+            call_id = self._extract_header(headers_text, 'Call-ID')
+            cseq = self._extract_header(headers_text, 'CSeq')
+            content_type = self._extract_header(headers_text, 'Content-Type')
+            from_uri = self._extract_username(from_hdr) or from_hdr
+
+            req_lines = headers_text.split("\r\n")
+            req_line0 = req_lines[0].strip() if req_lines else ""
+            rl_parts = req_line0.split()
+            ruri_user = ""
+            if len(rl_parts) >= 2:
+                ruri_user = self._extract_username(rl_parts[1]) or ""
+            to_user = (ruri_user or self._extract_username(to_hdr) or "").strip()
+
+            chat_text, eff_ct, persist_chat = normalize_inbound_message_for_chat(
+                body_bytes, content_type
+            )
+            body_display = _sanitize_sip_text_for_utf8_io(chat_text) if persist_chat else ""
+            # 릴레이·다른 UA 호환: datagram 본문 바이트 그대로 surrogateescape 로 복원
+            body = body_bytes.decode("utf-8", errors="surrogateescape")
+
+            def _sip_hdr_val(ht: str, name: str) -> str:
+                want = name.lower()
+                for line in (ht or "").split("\r\n"):
+                    if ":" not in line:
+                        continue
+                    k, v = line.split(":", 1)
+                    if k.strip().lower() == want:
+                        return v.strip()
+                return ""
+
+            skip_ai_followup = _sip_hdr_val(headers_text, "X-PBX-Skip-AI-Reply").lower() in (
+                "1",
+                "true",
+                "yes",
+            )
+
+            txn_key = self._sip_message_inbound_txn_key(call_id, cseq)
+            response = (
+                "SIP/2.0 200 OK\r\n"
+                f"Via: {via}\r\n"
+                f"From: {from_hdr}\r\n"
+                f"To: {to_hdr}\r\n"
+                f"Call-ID: {call_id}\r\n"
+                f"CSeq: {cseq}\r\n"
+                "Content-Length: 0\r\n"
+                "\r\n"
+            )
+            if txn_key and not self._sip_message_inbound_try_claim(txn_key):
+                logger.info(
+                    "sip_message_duplicate_txn_ignored",
+                    call_id=call_id,
+                    cseq=cseq,
+                    from_addr=f"{addr[0]}:{addr[1]}",
+                    persist_chat=persist_chat,
+                    note="동일 Call-ID·CSeq 재수신 — 200 OK만 반복, DB/WS/AI/릴레이 생략",
+                )
+                self._send_response(response, addr)
+                return
+
+            logger.info(
+                "sip_message_received",
+                from_uri=from_uri,
+                to_user=to_user or None,
+                ruri_user=ruri_user or None,
+                from_addr=f"{addr[0]}:{addr[1]}",
+                call_id=call_id,
+                content_type=content_type,
+                effective_content_type=eff_ct if persist_chat else None,
+                persist_chat=persist_chat,
+                body_length=len(body_bytes),
+                body_preview=_sanitize_sip_text_for_utf8_io(
+                    (body_display[:120] + "...")
+                    if len(body_display) > 120
+                    else (body_display or "(signaling or empty; not stored in chat)")
+                ),
+            )
+
+            print(f"\n💬 SIP MESSAGE from {from_uri} ({addr[0]}:{addr[1]})")
+            print(f"   내용: {body_display if persist_chat else '(시그널링/빈 본문 — 채팅 미저장)'}")
+
+            # 200 OK 응답 (RFC 3428 §4) — response 는 위 중복 검사 전에 이미 구성됨
+            self._send_response(response, addr)
+
+            fu = (from_uri or "").strip()
+            tu = (to_user or "").strip()
+
+            chat_owner_ws = ""
+            if persist_chat:
+                try:
+                    from src.services.chat_relay_service import resolve_chat_owner_for_inbound
+
+                    chat_owner_ws = resolve_chat_owner_for_inbound(tu) or ""
+                except Exception:
+                    chat_owner_ws = ""
+
+            # WebSocket — 채팅에 넣을 본문만 (isComposing 등은 제외)
+            if persist_chat:
+                try:
+                    from src.websocket.server import emit_sip_message_received
+
+                    asyncio.create_task(
+                        emit_sip_message_received(
+                            from_uri=from_uri,
+                            from_addr=f"{addr[0]}:{addr[1]}",
+                            body=body_display,
+                            content_type=eff_ct or content_type or "text/plain",
+                            call_id=call_id,
+                            to_user=tu,
+                            tenant_owner=chat_owner_ws,
+                        )
+                    )
+                except Exception as ws_err:
+                    logger.warning("sip_message_ws_emit_failed", error=str(ws_err))
+
+            # chat_messages DB 저장 (수신 메시지) — To/R-URI 내선 → 테넌트 owner 매핑
+            if persist_chat:
+                try:
+                    from src.services.chat_service import save_chat_message
+                    from src.services.chat_relay_service import resolve_chat_owner_for_inbound
+
+                    chat_owner = resolve_chat_owner_for_inbound(to_user)
+                    save_chat_message(
+                        thread_id=from_uri,
+                        owner=chat_owner,
+                        direction="inbound",
+                        from_phone=from_uri,
+                        to_phone=to_user or "pbx",
+                        body=body_display,
+                        call_id=call_id or "",
+                        status="delivered",
+                    )
+                    logger.info(
+                        "sip_message_chat_db_saved",
+                        from_uri=from_uri,
+                        to_user=to_user or "pbx",
+                        chat_owner=chat_owner,
+                        call_id=call_id,
+                        body_len=len(body_display),
+                    )
+                    # 내선↔내선: 수신함(owner=착신 테넌트)만 있으면 발신자 UI(owner=발신)에 안 보임.
+                    # 발신 측 owner로 outbound 복제(thread_id=상대)하여 API·소프트폰과 동일 이력 유지.
+                    if fu and tu and fu.lower() != tu.lower():
+                        try:
+                            sender_owner = resolve_chat_owner_for_inbound(fu)
+                            save_chat_message(
+                                thread_id=tu,
+                                owner=sender_owner,
+                                direction="outbound",
+                                from_phone=fu,
+                                to_phone=tu,
+                                body=body_display,
+                                call_id=call_id or "",
+                                status="delivered",
+                            )
+                            logger.info(
+                                "sip_message_chat_db_saved_outbound_mirror",
+                                sender_owner=sender_owner,
+                                from_uri=fu,
+                                to_user=tu,
+                                call_id=call_id,
+                                body_len=len(body_display),
+                            )
+                        except Exception as mir_err:
+                            logger.warning("sip_message_chat_db_mirror_failed", error=str(mir_err))
+                except Exception as db_err:
+                    logger.warning("sip_message_chat_db_failed", error=str(db_err))
+
+                # SIP 채팅 AI 자동응답 (페르소나 설정 시, LangGraph 경로 — PBX가 생성한 MESSAGE는 Skip 헤더로 재귀 방지)
+                if (
+                    not skip_ai_followup
+                    and body_display.strip()
+                    and fu
+                    and tu
+                    and fu.lower() != tu.lower()
+                ):
+                    try:
+                        from src.services.chat_relay_service import resolve_chat_owner_for_inbound
+                        from src.services.sip_message_ai_reply import schedule_sip_message_ai_reply
+
+                        _co_ai = resolve_chat_owner_for_inbound(to_user)
+                        _rf_ai, _ = self.lookup_registered_user(fu)
+                        _rt_ai, _ = self.lookup_registered_user(tu)
+                        if _rf_ai and _rt_ai:
+                            logger.info(
+                                "sip_message_ai_reply_scheduled",
+                                sip_ai_ctx="sip_message_ai_reply",
+                                call_id=call_id or "",
+                                chat_owner=_co_ai,
+                                from_peer=_rf_ai,
+                                to_peer=_rt_ai,
+                                inbound_preview=(body_display or "")[:120],
+                            )
+                            asyncio.create_task(
+                                schedule_sip_message_ai_reply(
+                                    sip_endpoint=self,
+                                    body_display=body_display,
+                                    chat_owner=_co_ai,
+                                    from_peer=_rf_ai,
+                                    to_peer=_rt_ai,
+                                    sip_call_id=call_id or "",
+                                )
+                            )
+                    except Exception as ai_sched_err:
+                        logger.warning(
+                            "sip_message_ai_reply_schedule_failed",
+                            error=str(ai_sched_err),
+                        )
+
+            # 다른 내선(To)으로 MESSAGE 릴레이 — UA가 sip:1004@… 로 직접 보낸 경우 PBX가 1004 Contact로 전달
+            if tu and fu and tu.lower() != fu.lower():
+                fk, from_info = self.lookup_registered_user(fu)
+                tk, to_info = self.lookup_registered_user(tu)
+                if fk and tk and from_info and to_info:
+                    relay_ct = (content_type or "text/plain; charset=UTF-8").strip()
+
+                    async def _relay_peer_message(
+                        fk_: str = fk,
+                        tk_: str = tk,
+                        body_: str = body,
+                        ct_: str = relay_ct,
+                    ) -> None:
+                        try:
+                            result = await asyncio.to_thread(
+                                self.send_chat_sip_message,
+                                fk_,
+                                tk_,
+                                body_,
+                                ct_,
+                            )
+                            logger.info(
+                                "sip_message_relay_finished",
+                                from_user=fk_,
+                                to_user=tk_,
+                                success=bool(result.get("success")),
+                                code=result.get("code") or None,
+                                detail=(result.get("message") or "")[:300] or None,
+                            )
+                        except Exception as re:
+                            logger.error(
+                                "sip_message_relay_error",
+                                from_user=fk_,
+                                to_user=tk_,
+                                error=str(re),
+                                exc_info=True,
+                            )
+
+                    logger.info(
+                        "sip_message_relay_started",
+                        from_user=fk,
+                        to_user=tk,
+                        body_len=len(body),
+                        content_type=relay_ct[:120],
+                    )
+                    asyncio.create_task(_relay_peer_message())
+                else:
+                    logger.info(
+                        "sip_message_relay_skipped",
+                        from_user=fu,
+                        to_user=tu,
+                        from_registered=bool(fk and from_info),
+                        to_registered=bool(tk and to_info),
+                        note="양쪽 내선이 REGISTER 맵에 있을 때만 다른 내선으로 릴레이",
+                    )
+
+        except Exception as e:
+            logger.error("sip_message_method_error", error=str(e), exc_info=True)
+
+    def send_sip_message(self, to_uri: str, body: str, content_type: str = 'text/plain; charset=UTF-8') -> bool:
+        """SIP MESSAGE 아웃바운드 발신 (서버 → Linphone 등 소프트폰)
+
+        등록된 사용자에게 SIP MESSAGE를 전송한다.
+        예약 확인·알림 SMS 시나리오 테스트용.
+
+        Args:
+            to_uri: 수신 대상 SIP URI 또는 username (예: '1001' 또는 'sip:1001@192.168.1.1')
+            body: 메시지 본문
+            content_type: Content-Type (기본 text/plain)
+
+        Returns:
+            bool: 전송 성공 여부
+        """
+        import random
+
+        try:
+            # username으로 등록 정보 조회
+            username = to_uri.split('@')[0].replace('sip:', '').strip('<>') if '@' in to_uri else to_uri
+            user_info = self._registered_users.get(username)
+
+            if not user_info:
+                logger.warning("sip_message_send_no_registered_user",
+                               to_uri=to_uri, username=username,
+                               registered=list(self._registered_users.keys()))
+                return False
+
+            dest_addr = (user_info['ip'], user_info['port'])
+            # 바인드 주소 0.0.0.0 은 Via/From/Call-ID 에 넣지 않음 — 일부 UA·NAT에서 비정상 동작
+            hdr_host = self._get_b2bua_ip()
+            listen_port = self.config.sip.listen_port
+
+            branch = f"z9hG4bK{random.randint(100000, 999999)}"
+            call_id = f"msg-{random.randint(10000, 99999)}@{hdr_host}"
+            # 수신 측 decode(..., surrogateescape)로 만든 str은 송신 시 surrogatepass로만
+            # 원바이트에 가깝게 round-trip 가능(surrogateescape로 encode 시 서로게이트에서 예외).
+            body_bytes = body.encode("utf-8", errors="surrogatepass")
+            ct_hdr = _sanitize_sip_text_for_utf8_io((content_type or "text/plain; charset=UTF-8").strip()) or "text/plain; charset=UTF-8"
+
+            hdr = (
+                f"MESSAGE sip:{username}@{dest_addr[0]}:{dest_addr[1]} SIP/2.0\r\n"
+                f"Via: SIP/2.0/UDP {hdr_host}:{listen_port};branch={branch}\r\n"
+                f"From: <sip:pbx@{hdr_host}>;tag=pbx-{random.randint(1000,9999)}\r\n"
+                f"To: <sip:{username}@{dest_addr[0]}:{dest_addr[1]}>\r\n"
+                f"Call-ID: {call_id}\r\n"
+                f"CSeq: 1 MESSAGE\r\n"
+                f"Max-Forwards: 70\r\n"
+                f"Content-Type: {ct_hdr}\r\n"
+                f"Content-Length: {len(body_bytes)}\r\n"
+                "\r\n"
+            )
+            # 헤더 값에 U+D800–U+DFFF(예: 본문 바이트 surrogateescape 경로와 섞인 토큰)가 있으면 strict UTF-8 실패
+            packet = hdr.encode("utf-8", errors="surrogatepass") + body_bytes
+
+            self._socket.sendto(packet, dest_addr)
+
+            logger.info(
+                "sip_message_sent",
+                kind="server_push",
+                to_uri=to_uri,
+                to_user=username,
+                dest_addr=f"{dest_addr[0]}:{dest_addr[1]}",
+                sip_header_host=hdr_host,
+                body_length=len(body),
+                body_preview=_sanitize_sip_text_for_utf8_io(
+                    (body[:120] + "...") if len(body) > 120 else body
+                ),
+            )
+            print(f"\n📤 SIP MESSAGE → {username} ({dest_addr[0]}:{dest_addr[1]})")
+            print(f"   내용: {body}")
+            try:
+                from src.websocket.server import schedule_sip_message_sent
+
+                tenant_owner = ""
+                try:
+                    from src.services.chat_relay_service import resolve_chat_owner_for_inbound
+
+                    tenant_owner = resolve_chat_owner_for_inbound(username) or ""
+                except Exception:
+                    tenant_owner = ""
+                schedule_sip_message_sent(
+                    kind="server_push",
+                    to_uri=to_uri,
+                    to_user=username,
+                    body=body,
+                    call_id=call_id,
+                    tenant_owner=tenant_owner,
+                    ok=True,
+                    sip_status="udp_sent",
+                )
+            except Exception as ws_sched_err:
+                logger.debug("sip_message_sent_ws_schedule_failed", error=str(ws_sched_err))
+            return True
+
+        except Exception as e:
+            logger.error("sip_message_send_error", error=str(e), exc_info=True)
+            return False
+
+    def _registered_user_key_candidates(self, raw: str) -> list[str]:
+        """REGISTER 맵 조회용 후보 키 (내선 그대로·숫자만·선행 + 제거)."""
+        u = (raw or "").strip()
+        if not u:
+            return []
+        norm = "".join(c for c in u if c.isdigit() or c == "+")
+        out: list[str] = []
+        for k in (u, norm, norm.lstrip("+") if norm else ""):
+            if k and k not in out:
+                out.append(k)
+        return out
+
+    def lookup_registered_user(self, raw: str) -> tuple[str | None, dict | None]:
+        """등록 사용자 (username → contact 주소) 조회."""
+        for k in self._registered_user_key_candidates(raw):
+            info = self._registered_users.get(k)
+            if info:
+                return k, info
+        return None, None
+
+    def _register_chat_message_client_txn(self, call_id: str, top_via_branch: str = "") -> threading.Event:
+        ev = threading.Event()
+        with self._message_txn_lock:
+            self._message_txn_pending[call_id] = {
+                "event": ev,
+                "status": None,
+                "ok": False,
+                "branch": (top_via_branch or "").strip(),
+            }
+        return ev
+
+    def _complete_chat_message_client_txn(
+        self, call_id: str, status_code: str, *, response: str | None = None
+    ) -> bool:
+        """MESSAGE 최종 응답을 대기 중인 클라이언트 트랜잭션에 반영. 매칭 시 True.
+
+        Call-ID 로 pending 을 찾는다. 응답 최상단 Via branch 가 요청과 다르면 로그만 남기고
+        그대로 완료 처리한다(UA 가 Via 를 재작성하는 경우 200 OK 가 무시되지 않도록).
+        """
+        with self._message_txn_lock:
+            rec = self._message_txn_pending.get(call_id)
+        if not rec:
+            return False
+        expected_branch = (rec.get("branch") or "").strip()
+        if expected_branch and response:
+            rb = self._extract_top_via_branch(response)
+            if rb and rb != expected_branch:
+                # Via 순서·UA 추가 Via 등으로 branch 가 어긋나도 Call-ID 는 채팅 클라이언트 txn 에서 유일하다.
+                # 이전에는 여기서 return False → 200 OK 가 무시·타임아웃·success=false 만 유발(UDP는 이미 도착).
+                logger.info(
+                    "chat_message_txn_via_branch_mismatch_ignored",
+                    call_id=call_id,
+                    expected_branch=expected_branch[:48],
+                    response_branch=rb[:48],
+                )
+        try:
+            sc = int(status_code)
+            rec["ok"] = 200 <= sc < 300
+        except ValueError:
+            rec["ok"] = False
+        rec["status"] = status_code
+        ev = rec.get("event")
+        if isinstance(ev, threading.Event):
+            ev.set()
+        return True
+
+    def _unregister_chat_message_client_txn(self, call_id: str) -> None:
+        with self._message_txn_lock:
+            self._message_txn_pending.pop(call_id, None)
+
+    def send_chat_sip_message(
+        self,
+        from_user: str,
+        to_user: str,
+        body: str,
+        content_type: str = "text/plain; charset=UTF-8",
+        *,
+        suppress_ai_loop: bool = False,
+        wait_for_final_response: bool = True,
+    ) -> dict:
+        """REGISTER 된 발신·수신 내선 간 SIP MESSAGE (채팅 관리용).
+
+        UDP 전송 후 **원격 UA의 최종 SIP 응답(2xx–6xx)** 을 ``_chat_message_txn_timeout_sec`` 안에 기다린다.
+        ``suppress_ai_loop=True`` 이면 PBX가 수신 시 SIP 채팅 AI 자동응답을 다시 돌리지 않도록
+        ``X-PBX-Skip-AI-Reply`` 헤더를 붙인다(AI가 보낸 MESSAGE 재귀 방지).
+
+        ``wait_for_final_response=False`` 이면 UDP 전송 직후 반환하고, 동일 타임아웃으로
+        2xx/6xx 수신·``schedule_sip_message_sent``·txn 정리는 백그라운드 스레드에서 수행한다
+        (AI 자동응답 등 긴 LLM 구간과 SIP 200 지연이 겹치지 않게).
+
+        Returns:
+            dict: success(bool), code(str), message(str). 비대기 모드는 code ``sip_pending``, call_id 포함.
+        """
+        import random
+
+        body = (body or "").strip()
+        if not body:
+            return {"success": False, "code": "empty_body", "message": "메시지 본문이 비었습니다."}
+
+        fk, from_info = self.lookup_registered_user(from_user)
+        if not fk or not from_info:
+            return {
+                "success": False,
+                "code": "sender_not_registered",
+                "message": f"발신 내선이 SIP에 등록되어 있지 않습니다: {from_user!r}",
+            }
+
+        tk, to_info = self.lookup_registered_user(to_user)
+        if not tk or not to_info:
+            return {
+                "success": False,
+                "code": "recipient_not_registered",
+                "message": f"수신 내선이 SIP에 등록되어 있지 않습니다: {to_user!r}",
+            }
+
+        hdr_host = self._get_b2bua_ip()
+        call_id = f"{uuid.uuid4().hex}@{hdr_host}"
+        txn_defer_unregister = False
+        try:
+            dest_addr = (to_info["ip"], to_info["port"])
+            listen_port = self.config.sip.listen_port
+
+            branch = f"z9hG4bK{random.randint(100000, 999999)}"
+            body_bytes = body.encode("utf-8", errors="surrogatepass")
+            _sur = any(0xD800 <= ord(c) <= 0xDFFF for c in body)
+            logger.debug(
+                "chat_sip_message_body_encode",
+                body_has_surrogate=_sur,
+                body_len=len(body),
+                content_type_preview=(content_type or "")[:100],
+                note="surrogateescape 수신 str → 송신은 surrogatepass + 헤더/본문 바이트 결합",
+            )
+
+            _skip_ai_hdr = "X-PBX-Skip-AI-Reply: 1\r\n" if suppress_ai_loop else ""
+            ct_hdr = _sanitize_sip_text_for_utf8_io((content_type or "text/plain; charset=UTF-8").strip()) or "text/plain; charset=UTF-8"
+            hdr = (
+                f"MESSAGE sip:{tk}@{dest_addr[0]}:{dest_addr[1]} SIP/2.0\r\n"
+                f"Via: SIP/2.0/UDP {hdr_host}:{listen_port};branch={branch}\r\n"
+                f"From: <sip:{fk}@{hdr_host}>;tag=chat-{random.randint(1000, 9999)}\r\n"
+                f"To: <sip:{tk}@{dest_addr[0]}:{dest_addr[1]}>\r\n"
+                f"Call-ID: {call_id}\r\n"
+                f"CSeq: 1 MESSAGE\r\n"
+                f"Max-Forwards: 70\r\n"
+                f"{_skip_ai_hdr}"
+                f"Content-Type: {ct_hdr}\r\n"
+                f"Content-Length: {len(body_bytes)}\r\n"
+                "\r\n"
+            )
+            packet = hdr.encode("utf-8", errors="surrogatepass") + body_bytes
+
+            top_branch = self._extract_top_via_branch(hdr)
+            ev = self._register_chat_message_client_txn(call_id, top_branch)
+
+            if not self._socket:
+                return {"success": False, "code": "sip_socket_down", "message": "SIP 소켓이 없습니다."}
+
+            self._socket.sendto(packet, dest_addr)
+
+            logger.info(
+                "sip_message_udp_sent",
+                kind="chat_relay",
+                from_user=fk,
+                to_user=tk,
+                dest_addr=f"{dest_addr[0]}:{dest_addr[1]}",
+                sip_header_host=hdr_host,
+                body_len=len(body),
+                body_preview=_sanitize_sip_text_for_utf8_io(
+                    (body[:120] + "...") if len(body) > 120 else body
+                ),
+                call_id=call_id,
+            )
+            logger.info(
+                "chat_sip_message_awaiting_response",
+                from_user=fk,
+                to_user=tk,
+                dest_addr=f"{dest_addr[0]}:{dest_addr[1]}",
+                body_len=len(body),
+                call_id=call_id,
+                wait_for_final_response=wait_for_final_response,
+            )
+
+            if not wait_for_final_response:
+                txn_defer_unregister = True
+                ep = self
+                timeout_sec = float(self._chat_message_txn_timeout_sec)
+                fk_t, tk_t, body_t, call_id_t = fk, tk, body, call_id
+
+                def _chat_message_txn_waiter() -> None:
+                    try:
+                        if not ev.wait(timeout=timeout_sec):
+                            logger.warning(
+                                "chat_sip_message_response_timeout",
+                                call_id=call_id_t,
+                                timeout_sec=timeout_sec,
+                                from_user=fk_t,
+                                to_user=tk_t,
+                                dest_addr=f"{dest_addr[0]}:{dest_addr[1]}",
+                                note="비대기 모드 — 백그라운드에서 타임아웃",
+                            )
+                            return
+                        with ep._message_txn_lock:
+                            rec = ep._message_txn_pending.get(call_id_t, {})
+                        ok = bool(rec.get("ok"))
+                        st = str(rec.get("status") or "")
+                        if ok:
+                            logger.info(
+                                "chat_sip_message_delivered",
+                                from_user=fk_t,
+                                to_user=tk_t,
+                                sip_status=st,
+                                call_id=call_id_t,
+                            )
+                            try:
+                                from src.services.chat_relay_service import (
+                                    resolve_chat_owner_for_inbound,
+                                )
+                                from src.websocket.server import schedule_sip_message_sent
+
+                                _to = resolve_chat_owner_for_inbound(fk_t) or ""
+                                schedule_sip_message_sent(
+                                    kind="chat_relay",
+                                    from_user=fk_t,
+                                    to_user=tk_t,
+                                    to_uri=f"sip:{tk_t}",
+                                    body=body_t,
+                                    call_id=call_id_t,
+                                    tenant_owner=_to,
+                                    ok=True,
+                                    sip_status=st,
+                                )
+                            except Exception as ws_sched_err:
+                                logger.debug(
+                                    "chat_sip_message_sent_ws_schedule_failed",
+                                    error=str(ws_sched_err),
+                                )
+                            return
+                        logger.info(
+                            "chat_sip_message_rejected",
+                            from_user=fk_t,
+                            to_user=tk_t,
+                            sip_status=st,
+                            call_id=call_id_t,
+                        )
+                        try:
+                            from src.services.chat_relay_service import (
+                                resolve_chat_owner_for_inbound,
+                            )
+                            from src.websocket.server import schedule_sip_message_sent
+
+                            _to = resolve_chat_owner_for_inbound(fk_t) or ""
+                            schedule_sip_message_sent(
+                                kind="chat_relay",
+                                from_user=fk_t,
+                                to_user=tk_t,
+                                to_uri=f"sip:{tk_t}",
+                                body=body_t,
+                                call_id=call_id_t,
+                                tenant_owner=_to,
+                                ok=False,
+                                sip_status=st,
+                            )
+                        except Exception as ws_sched_err:
+                            logger.debug(
+                                "chat_sip_message_reject_ws_schedule_failed",
+                                error=str(ws_sched_err),
+                            )
+                    finally:
+                        ep._unregister_chat_message_client_txn(call_id_t)
+
+                threading.Thread(
+                    target=_chat_message_txn_waiter,
+                    name="chat_sip_msg_txn",
+                    daemon=True,
+                ).start()
+                return {
+                    "success": True,
+                    "code": "sip_pending",
+                    "message": "",
+                    "call_id": call_id,
+                }
+
+            if not ev.wait(timeout=self._chat_message_txn_timeout_sec):
+                logger.warning(
+                    "chat_sip_message_response_timeout",
+                    call_id=call_id,
+                    timeout_sec=self._chat_message_txn_timeout_sec,
+                    from_user=fk,
+                    to_user=tk,
+                    dest_addr=f"{dest_addr[0]}:{dest_addr[1]}",
+                    note="UDP로 보낸 MESSAGE에 대해 같은 소켓에서 2xx 최종응답을 못 받음 — UA 미응답·NAT·Call-ID/CSeq 불일치·sip_traffic 로그에서 200 OK 수신 여부 확인",
+                )
+                return {
+                    "success": False,
+                    "code": "sip_timeout",
+                    "message": f"MESSAGE 최종 응답 없음 ({self._chat_message_txn_timeout_sec:.0f}s 초과)",
+                }
+
+            with self._message_txn_lock:
+                rec = self._message_txn_pending.get(call_id, {})
+            ok = bool(rec.get("ok"))
+            st = str(rec.get("status") or "")
+            if ok:
+                logger.info(
+                    "chat_sip_message_delivered",
+                    from_user=fk,
+                    to_user=tk,
+                    sip_status=st,
+                    call_id=call_id,
+                )
+                try:
+                    from src.services.chat_relay_service import resolve_chat_owner_for_inbound
+                    from src.websocket.server import schedule_sip_message_sent
+
+                    _to = resolve_chat_owner_for_inbound(fk) or ""
+                    schedule_sip_message_sent(
+                        kind="chat_relay",
+                        from_user=fk,
+                        to_user=tk,
+                        to_uri=f"sip:{tk}",
+                        body=body,
+                        call_id=call_id,
+                        tenant_owner=_to,
+                        ok=True,
+                        sip_status=st,
+                    )
+                except Exception as ws_sched_err:
+                    logger.debug("chat_sip_message_sent_ws_schedule_failed", error=str(ws_sched_err))
+                return {"success": True, "code": "", "message": ""}
+
+            logger.info(
+                "chat_sip_message_rejected",
+                from_user=fk,
+                to_user=tk,
+                sip_status=st,
+                call_id=call_id,
+            )
+            try:
+                from src.services.chat_relay_service import resolve_chat_owner_for_inbound
+                from src.websocket.server import schedule_sip_message_sent
+
+                _to = resolve_chat_owner_for_inbound(fk) or ""
+                schedule_sip_message_sent(
+                    kind="chat_relay",
+                    from_user=fk,
+                    to_user=tk,
+                    to_uri=f"sip:{tk}",
+                    body=body,
+                    call_id=call_id,
+                    tenant_owner=_to,
+                    ok=False,
+                    sip_status=st,
+                )
+            except Exception as ws_sched_err:
+                logger.debug("chat_sip_message_reject_ws_schedule_failed", error=str(ws_sched_err))
+            return {
+                "success": False,
+                "code": f"sip_{st}" if st else "sip_error",
+                "message": f"상대 UA 응답 SIP/2.0 {st}".strip(),
+            }
+
+        except Exception as e:
+            logger.error("chat_sip_message_send_error", error=str(e), exc_info=True)
+            return {"success": False, "code": "send_error", "message": str(e)}
+        finally:
+            if not txn_defer_unregister:
+                self._unregister_chat_message_client_txn(call_id)
+
+    def _create_not_implemented_response(self, request: str, addr: tuple) -> str:
+        """501 Not Implemented 응답 생성
+        
+        Args:
+            request: 요청 메시지
+            addr: 송신자 주소
+            
+        Returns:
+            str: 응답 메시지
+        """
+        via = self._extract_header(request, 'Via')
+        from_hdr = self._extract_header(request, 'From')
+        to_hdr = self._extract_header(request, 'To')
+        call_id = self._extract_header(request, 'Call-ID')
+        cseq = self._extract_header(request, 'CSeq')
+        
+        return (
+            "SIP/2.0 501 Not Implemented\r\n"
+            f"Via: {via}\r\n"
+            f"From: {from_hdr}\r\n"
+            f"To: {to_hdr}\r\n"
+            f"Call-ID: {call_id}\r\n"
+            f"CSeq: {cseq}\r\n"
+            "Content-Length: 0\r\n"
+            "\r\n"
+        )
+    
+    async def _listen_loop(self) -> None:
+        """UDP 소켓 리스닝 루프"""
+        import asyncio
+        import socket
+        import time
+        
+        try:
+            # UDP 소켓 생성
+            bind_start = time.time()
+            logger.debug("udp_socket_binding",
+                        listen_ip=self.config.sip.listen_ip,
+                        listen_port=self.config.sip.listen_port)
+            
+            self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self._socket.bind((self.config.sip.listen_ip, self.config.sip.listen_port))
+            self._socket.setblocking(False)
+            
+            bind_elapsed = time.time() - bind_start
+            logger.info("udp_socket_bound",
+                       listen_ip=self.config.sip.listen_ip,
+                       listen_port=self.config.sip.listen_port,
+                       bind_time=f"{bind_elapsed:.3f}s")
+            
+            loop = asyncio.get_event_loop()
+            
+            while self._running:
+                try:
+                    # Non-blocking receive
+                    data, addr = await loop.sock_recvfrom(self._socket, 65535)
+                    asyncio.create_task(self._handle_sip_message(data, addr))
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.error("socket_receive_error", error=str(e))
+                    await asyncio.sleep(0.1)
+                    
+        except Exception as e:
+            logger.error("sip_listen_error", error=str(e))
+        finally:
+            if self._socket:
+                self._socket.close()
+    
+    def start(self) -> None:
+        """SIP B2BUA 서버 시작"""
+        import asyncio
+        
+        self._running = True
+        
+        # asyncio 이벤트 루프 가져오기
+        try:
+            loop = asyncio.get_running_loop()
+            self._listen_task = loop.create_task(self._listen_loop())
+        except RuntimeError:
+            # 이벤트 루프가 없으면 나중에 시작될 것임
+            logger.warning("no_event_loop", 
+                          message="Event loop not running, socket will not bind")
+        
+        logger.info("sip_server_started",
+                   listen_ip=self.config.sip.listen_ip,
+                   listen_port=self.config.sip.listen_port)
+    
+    def _retransmit_invite(self, transaction_id: str) -> None:
+        """INVITE 재전송 (Transaction Timer 콜백)
+        
+        Args:
+            transaction_id: 트랜잭션 ID
+        """
+        try:
+            # transaction_id로 call_info 찾기
+            call_info = None
+            for cid, info in self._active_calls.items():
+                if info.get('transaction_id') == transaction_id:
+                    call_info = info
+                    break
+            
+            if not call_info:
+                logger.warning("retransmit_invite_no_call", transaction_id=transaction_id)
+                return
+            
+            invite_message = call_info.get('invite_message')
+            callee_addr = call_info.get('callee_addr_for_retransmit')
+            
+            if invite_message and callee_addr:
+                self._send_response(invite_message, callee_addr)
+                logger.info("invite_retransmitted",
+                           transaction_id=transaction_id,
+                           call_id=call_info.get('original_call_id'))
+            
+        except Exception as e:
+            logger.error("retransmit_invite_error",
+                        transaction_id=transaction_id,
+                        error=str(e))
+    
+    async def _handle_bye_timeout(self, transaction_id: str) -> None:
+        """BYE 타임아웃 처리 (Transaction Timer 콜백)
+        
+        Args:
+            transaction_id: 트랜잭션 ID
+        """
+        try:
+            # transaction_id로 call_info 찾기
+            call_info = None
+            original_call_id = None
+            for cid, info in self._active_calls.items():
+                if info.get('bye_transaction_id') == transaction_id:
+                    call_info = info
+                    original_call_id = info.get('original_call_id')
+                    break
+            
+            if not call_info:
+                logger.warning("bye_timeout_no_call", transaction_id=transaction_id)
+                return
+            
+            logger.warning("bye_timeout",
+                          transaction_id=transaction_id,
+                          call_id=original_call_id,
+                          timeout=self.config.sip.timers.bye_timeout)
+            
+            # 강제 세션 정리
+            if original_call_id:
+                await self._cleanup_call(original_call_id)
+            
+        except Exception as e:
+            logger.error("bye_timeout_error",
+                        transaction_id=transaction_id,
+                        error=str(e),
+                        exc_info=True)
+    
+    async def _send_session_update(self, call_id: str) -> None:
+        """세션 갱신 UPDATE 메시지 전송 (Session Timer 콜백)
+        
+        Args:
+            call_id: Call-ID
+        """
+        try:
+            if call_id not in self._active_calls:
+                logger.warning("session_update_no_call", call_id=call_id)
+                return
+            
+            call_info = self._active_calls[call_id]
+            
+            # B2BUA IP 가져오기 (SDP c= 라인용)
+            b2bua_ip = self._get_b2bua_ip()
+            
+            # Caller와 Callee에게 UPDATE 전송 (세션 유지)
+            # 실제로는 한쪽(refresher)만 보내면 되지만, 양쪽 모두에게 보내는 것이 안전
+            
+            # Caller에게 UPDATE
+            caller_addr = call_info.get('caller_addr')
+            if caller_addr:
+                update_to_caller = (
+                    f"UPDATE sip:{call_info['caller_username']}@{caller_addr[0]}:{caller_addr[1]} SIP/2.0\r\n"
+                    f"Via: SIP/2.0/UDP {b2bua_ip}:{self.config.sip.listen_port};branch=z9hG4bK{random.randint(100000, 999999)}\r\n"
+                    f"From: <sip:{call_info['callee_username']}@{b2bua_ip}>;tag={call_info.get('callee_tag', 'b2bua')}\r\n"
+                    f"To: <sip:{call_info['caller_username']}@{b2bua_ip}>;tag={call_info.get('caller_tag', '')}\r\n"
+                    f"Call-ID: {call_id}\r\n"
+                    "CSeq: 3 UPDATE\r\n"
+                    f"Session-Expires: {self.config.sip.timers.session_expires};refresher={self.config.sip.timers.session_refresher}\r\n"
+                    "Max-Forwards: 70\r\n"
+                    "Content-Length: 0\r\n"
+                    "\r\n"
+                )
+                self._send_response(update_to_caller, caller_addr)
+                logger.info("session_update_sent",
+                           call_id=call_id,
+                           to="caller",
+                           expires=self.config.sip.timers.session_expires)
+            
+            logger.debug("session_update_sent", call_id=call_id)
+            
+        except Exception as e:
+            logger.error("session_update_error",
+                        call_id=call_id,
+                        error=str(e),
+                        exc_info=True)
+    
+    async def _ai_takeover_send_200_ok_to_caller(
+        self,
+        call_id: str,
+        *,
+        stop_ringback: bool = True,
+        send_cancel_to_callee: bool = True,
+    ) -> bool:
+        """AI 인수: 발신 INVITE에 200 OK+SDP 전송 및 RTP 워커 AI 경로 준비.
+
+        immediate_ai(착신 INVITE 생략)와 무응답 AI 터크오버가 공유한다.
+        이미 ``caller_200_ok_sent`` 이면 SIP 재전송 없이 True 반환(멱등).
+        """
+        call_info = self._active_calls.get(call_id)
+        if not call_info:
+            logger.warning("ai_takeover_200_no_call_info", call_id=call_id)
+            return False
+        if call_info.get("caller_200_ok_sent"):
+            logger.info(
+                "ai_takeover_200_already_sent_skip",
+                call_id=call_id,
+                note="caller_200_ok_sent=True — SIP 200 OK 생략",
+            )
+            return True
+
+        callee_username = (
+            call_info.get("callee_username")
+            or call_info.get("callee")
+            or call_info.get("to_username")
+            or ""
+        )
+
+        if send_cancel_to_callee:
+            self._forward_cancel_to_callee_leg(call_info, reason="ai_takeover_pre_200")
+        b2bua_ip = self._get_b2bua_ip()
+
+        if stop_ringback:
+            await self._stop_ringback_player(call_id)
+
+        caller_addr = call_info.get("caller_addr")
+        caller_rtp_port = None
+        caller_rtcp_port = None
+
+        if caller_addr:
+            media_session = self.media_session_manager.get_session(call_id)
+            if media_session:
+                caller_rtp_port = media_session.caller_leg.get_audio_rtp_port()
+                caller_rtcp_port = media_session.caller_leg.get_audio_rtcp_port()
+                logger.info(
+                    "🔄 [AI Takeover] Using allocated RTP ports",
+                    call_id=call_id,
+                    caller_rtp_port=caller_rtp_port,
+                    caller_rtcp_port=caller_rtcp_port,
+                )
+
+                if caller_rtp_port < 10000 or caller_rtp_port > 10100:
+                    logger.warning(
+                        "🔄 [AI Takeover] RTP port out of firewall range, adjusting",
+                        call_id=call_id,
+                        original_port=caller_rtp_port,
+                        new_port=10000,
+                    )
+                    caller_rtp_port = 10000
+                    caller_rtcp_port = 10001
+            else:
+                caller_rtp_port = 10000
+                caller_rtcp_port = 10001
+                logger.warning(
+                    "🔄 [AI Takeover] No media session found, using default port",
+                    call_id=call_id,
+                    default_port=caller_rtp_port,
+                )
+
+        call_info["ai_mode_activated"] = True
+        call_info["is_ai_call"] = True
+        call_info["state"] = "answering"
+        logger.info(
+            "ai_mode_activated",
+            call_id=call_id,
+            callee=callee_username,
+            sip_phase="ai_takeover_before_200_ok",
+        )
+
+        rtp_worker = self._rtp_workers.get(call_id)
+        if rtp_worker:
+            logger.info("🔄 [AI Takeover] Enabling AI mode on RTP Worker", call_id=call_id)
+
+            if "callee_audio_rtp" in rtp_worker.protocols:
+                rtp_worker.protocols["callee_audio_rtp"].remote_endpoint = rtp_worker.caller_endpoint
+                rtp_worker.protocols["callee_audio_rtp"].remote_port = rtp_worker.caller_endpoint.port
+            if "callee_audio_rtcp" in rtp_worker.protocols:
+                rtp_worker.protocols["callee_audio_rtcp"].remote_endpoint = rtp_worker.caller_rtcp_endpoint
+                rtp_worker.protocols["callee_audio_rtcp"].remote_port = rtp_worker.caller_rtcp_endpoint.port
+            if "callee_audio_rtp" in rtp_worker.protocols:
+                logger.info(
+                    "✅ [AI Takeover] Callee Transport redirected to Caller",
+                    call_id=call_id,
+                    caller_endpoint=f"{rtp_worker.caller_endpoint.ip}:{rtp_worker.caller_endpoint.port}",
+                    note="TTS 오디오가 Caller로 정확히 전송되도록 설정",
+                )
+
+            rtp_worker.ai_mode = True
+
+            if self.call_manager and self.call_manager.ai_orchestrator:
+                if self.call_manager.pipecat_builder:
+                    logger.info(
+                        "✅ [AI Takeover] Pipecat mode - RTP Worker ready",
+                        call_id=call_id,
+                    )
+                else:
+                    rtp_worker.enable_ai_mode(self.call_manager.ai_orchestrator)
+                    _worker = rtp_worker
+                    _loop = asyncio.get_event_loop()
+
+                    async def _rtp_send_wrapper(audio_data: bytes):
+                        await _loop.run_in_executor(None, lambda: _worker.send_ai_audio(audio_data))
+
+                    self.call_manager.ai_orchestrator.set_rtp_callback(_rtp_send_wrapper)
+                    logger.info(
+                        "✅ [AI Takeover] Legacy mode - RTP Worker + callback connected",
+                        call_id=call_id,
+                    )
+            else:
+                logger.warning(
+                    "🔄 [AI Takeover] AI Orchestrator not available (caller RTP will still go to on_packet_received)",
+                    call_id=call_id,
+                )
+
+            try:
+                rtp_worker.send_stun_binding_request_to_caller()
+                logger.info(
+                    "🎯 [AI Takeover] STUN Binding Request sent to caller (BEFORE 200 OK)",
+                    call_id=call_id,
+                )
+            except Exception as stun_err:
+                logger.warning(
+                    "stun_request_before_200ok_failed",
+                    call_id=call_id,
+                    error=str(stun_err),
+                )
+        else:
+            logger.warning("🔄 [AI Takeover] No RTP worker found", call_id=call_id)
+
+        ok_sent = False
+        if caller_addr and caller_rtp_port and caller_rtcp_port:
+            logger.info(
+                "🔄 [AI Takeover] Sending 200 OK to caller (connecting to AI)",
+                call_id=call_id,
+            )
+
+            original_sdp = call_info.get("sdp", "")
+            original_attributes = []
+            session_id = "3059"
+            session_version = "3909"
+
+            if original_sdp:
+                lines = original_sdp.split("\r\n") if "\r\n" in original_sdp else original_sdp.split("\n")
+                for line in lines:
+                    line_stripped = line.strip()
+                    if line_stripped.startswith("o="):
+                        parts = line_stripped.split()
+                        if len(parts) >= 3:
+                            session_id = parts[1]
+                            session_version = parts[2]
+                        break
+
+                in_audio_media = False
+                for line in lines:
+                    line_stripped = line.strip()
+                    if line_stripped.startswith("m=audio"):
+                        in_audio_media = True
+                    elif line_stripped.startswith("m=") and not line_stripped.startswith("m=audio"):
+                        in_audio_media = False
+                    elif in_audio_media and line_stripped.startswith("a="):
+                        attr = line_stripped[2:]
+                        if attr.startswith("rtcp-xr:"):
+                            original_attributes.append(f"a={attr}\r\n")
+                        elif attr.startswith("record:"):
+                            original_attributes.append(f"a={attr}\r\n")
+                        elif attr.startswith("rtcp-fb:") and "trr-int" in attr:
+                            original_attributes.append(f"a={attr}\r\n")
+
+            sdp_lines = [
+                f"v=0\r\n",
+                f"o={callee_username} {session_id} {session_version} IN IP4 {b2bua_ip}\r\n",
+                f"s=Talk\r\n",
+                f"c=IN IP4 {b2bua_ip}\r\n",
+                f"t=0 0\r\n",
+            ]
+            sdp_lines.extend(original_attributes)
+            sdp_lines.append(f"m=audio {caller_rtp_port} RTP/AVP 0 8 101\r\n")
+            sdp_lines.append(f"a=rtpmap:101 telephone-event/8000\r\n")
+            sdp_lines.append(f"a=rtcp:{caller_rtcp_port}\r\n")
+
+            sdp = "".join(sdp_lines)
+
+            original_via = call_info.get(
+                "original_via",
+                f"SIP/2.0/UDP {caller_addr[0]}:{caller_addr[1]};branch={call_info.get('original_via_branch', 'z9hG4bK000000')};rport",
+            )
+
+            original_to = call_info.get("original_to", f"sip:{callee_username}@{b2bua_ip}")
+            _stripped = original_to.strip()
+            if "<" in _stripped:
+                to_uri = _stripped
+            else:
+                to_uri = f"<{_stripped}>"
+
+            callee_tag = call_info.get("callee_tag")
+            if callee_tag:
+                to_header = f"{to_uri};tag={callee_tag}"
+                logger.info(
+                    "🔄 [AI Takeover] Using callee_tag from 180 Ringing",
+                    call_id=call_id,
+                    callee_tag=callee_tag,
+                )
+            else:
+                to_header = f"{to_uri};tag=ai-{call_id[:8]}"
+                logger.warning(
+                    "🔄 [AI Takeover] No callee_tag found, generating new tag",
+                    call_id=call_id,
+                    generated_tag=f"ai-{call_id[:8]}",
+                )
+
+            contact_uri = f"<sip:{callee_username}@{b2bua_ip}:{self.config.sip.listen_port}>"
+            allow = "INVITE, ACK, CANCEL, OPTIONS, BYE, REFER, NOTIFY, MESSAGE, SUBSCRIBE, INFO, PRACK, UPDATE"
+
+            ok_response = (
+                "SIP/2.0 200 OK\r\n"
+                f"Via: {original_via}\r\n"
+                f"From: {call_info.get('original_from')}\r\n"
+                f"To: {to_header}\r\n"
+                f"Call-ID: {call_id}\r\n"
+                f"CSeq: {call_info.get('original_cseq', '1 INVITE')}\r\n"
+                f"Contact: {contact_uri}\r\n"
+                f"Allow: {allow}\r\n"
+                f"Content-Type: application/sdp\r\n"
+                f"Content-Length: {len(sdp)}\r\n"
+                "\r\n"
+                f"{sdp}"
+            )
+
+            self._send_response(ok_response, caller_addr)
+            ok_sent = True
+            call_info["caller_200_ok_sent"] = True
+            call_info["answer_time"] = datetime.now()
+            logger.info(
+                "✅ [AI Takeover] 200 OK sent to caller",
+                call_id=call_id,
+                immediate_ai_path=not send_cancel_to_callee and not stop_ringback,
+            )
+        else:
+            logger.error(
+                "ai_takeover_200_missing_caller_or_ports",
+                call_id=call_id,
+                has_caller_addr=bool(caller_addr),
+                caller_rtp_port=caller_rtp_port,
+                caller_rtcp_port=caller_rtcp_port,
+            )
+
+        if rtp_worker:
+            try:
+                rtp_worker.send_stun_binding_request_to_caller()
+                logger.info(
+                    "🎯 [AI Takeover] STUN Binding Request sent to caller (AFTER 200 OK)",
+                    call_id=call_id,
+                )
+            except Exception as stun_err:
+                logger.warning(
+                    "stun_request_after_200ok_failed",
+                    call_id=call_id,
+                    error=str(stun_err),
+                )
+
+        return ok_sent
+
+    async def _handle_no_answer_timeout(self, call_id: str) -> None:
+        """부재중 타임아웃 처리 (AI 응대 모드 전환).
+
+        Args:
+            call_id: 원본 Call-ID (발신자 다이얼로그).
+        """
+        try:
+            call_info = self._active_calls.get(call_id)
+            if not call_info:
+                logger.warning("no_answer_timeout_no_call", call_id=call_id)
+                return
+            
+            # 이미 통화 수립됨 (200 OK 받음)
+            if call_info.get('state') == 'established':
+                logger.info("no_answer_timeout_already_established", call_id=call_id)
+                return
+
+            callee_username = (
+                call_info.get('callee_username')
+                or call_info.get('callee')
+                or call_info.get('to_username')
+                or ""
+            )
+            
+            logger.warning("no_answer_timeout_activating_ai",
+                          call_id=call_id,
+                          callee=callee_username,
+                          callee_from_call_info=call_info.get('callee_username'),
+                          timeout=self.config.sip.timers.no_answer_timeout)
+
+            await self._ai_takeover_send_200_ok_to_caller(
+                call_id,
+                stop_ringback=True,
+                send_cancel_to_callee=True,
+            )
+
+            # 🔄 AI 모드 전환 (CallManager를 통해 - 백그라운드로 실행)
+            if self.call_manager:
+                asyncio.create_task(
+                    self.call_manager.handle_no_answer_timeout(call_id, callee_username)
+                )
+                call_info['is_ai_call'] = True
+                call_info['ai_mode_activated'] = True
+                call_info['state'] = 'established'
+            else:
+                logger.error("no_answer_timeout_no_call_manager", call_id=call_id)
+                
+        except Exception as e:
+            logger.error("no_answer_timeout_error",
+                        call_id=call_id,
+                        error=str(e),
+                        exc_info=True)
+    
+    async def _handle_invite_timeout(self, transaction_id: str) -> None:
+        """INVITE 타임아웃 처리 (Transaction Timer 콜백)
+        
+        Args:
+            transaction_id: 트랜잭션 ID
+        """
+        try:
+            # transaction_id로 call_info 찾기
+            call_info = None
+            original_call_id = None
+            for cid, info in self._active_calls.items():
+                if info.get('transaction_id') == transaction_id:
+                    call_info = info
+                    original_call_id = info.get('original_call_id')
+                    break
+            
+            if not call_info:
+                logger.warning("invite_timeout_no_call", transaction_id=transaction_id)
+                return
+            
+            logger.warning("invite_timeout",
+                          transaction_id=transaction_id,
+                          call_id=original_call_id,
+                          timeout=64 * self.config.sip.timers.t1)
+            
+            # 발신자에게 408 Request Timeout 전송
+            caller_addr = call_info.get('caller_addr')
+            if caller_addr:
+                from_hdr = call_info.get('original_from')
+                to_hdr = call_info.get('original_to')
+                
+                timeout_response = (
+                    "SIP/2.0 408 Request Timeout\r\n"
+                    f"Via: SIP/2.0/UDP {caller_addr[0]}:{caller_addr[1]};branch={call_info.get('original_via_branch', 'z9hG4bK000000')}\r\n"
+                    f"From: {from_hdr}\r\n"
+                    f"To: {to_hdr};tag=b2bua-timeout\r\n"
+                    f"Call-ID: {original_call_id}\r\n"
+                    "CSeq: 1 INVITE\r\n"
+                    "Content-Length: 0\r\n"
+                    "\r\n"
+                )
+                self._send_response(timeout_response, caller_addr)
+            
+            # 통화 정리
+            await self._cleanup_call(original_call_id)
+            
+        except Exception as e:
+            logger.error("invite_timeout_error",
+                        transaction_id=transaction_id,
+                        error=str(e),
+                        exc_info=True)
+    
+    def _close_sip_traffic_log_file(self) -> None:
+        if self._sip_log_file:
+            try:
+                self._sip_log_file.close()
+                logger.info("sip_traffic_log_closed")
+            except Exception as e:
+                logger.error("sip_traffic_log_close_failed", error=str(e))
+            finally:
+                self._sip_log_file = None
+
+    def stop(self) -> None:
+        """긴급 중지: 루프 플래그만 내리고 listen 태스크를 취소한다.
+
+        UDP 소켓 닫기·트래픽 로그 정리는 ``_listen_loop`` 의 ``finally`` 및
+        :meth:`shutdown_async` 에서 수행한다. 프로세스 정상 종료 시에는 반드시
+        ``await shutdown_async()`` 를 호출할 것.
+        """
+        self._running = False
+        if self._listen_task and not self._listen_task.done():
+            self._listen_task.cancel()
+
+    async def shutdown_async(self, *, listen_join_timeout: Optional[float] = None) -> None:
+        """정상 종료: listen 태스크가 UDP 소켓을 닫을 때까지 대기한 뒤 SIP 트래픽 로그를 닫는다.
+
+        ``stop()`` 만 호출하면 취소된 코루틴이 한 틱도 실행되지 않은 채 다음 정리 단계로
+        넘어가 포트·백그라운드 SIP 처리 태스크가 잠시 남는 문제가 생길 수 있다.
+        """
+        if self._sip_shutdown_done:
+            logger.debug("sip_shutdown_async_idempotent_skip", message="이미 SIP 종료 단계 완료")
+            return
+        self._sip_shutdown_done = True
+
+        _to = listen_join_timeout
+        if _to is None:
+            raw = (os.environ.get("SIP_SHUTDOWN_LISTEN_TIMEOUT_SEC") or "15").strip()
+            try:
+                _to = float(max(1.0, min(120.0, float(raw))))
+            except ValueError:
+                _to = 15.0
+
+        self._running = False
+        t = self._listen_task
+        if t is not None:
+            if not t.done():
+                t.cancel()
+                try:
+                    await asyncio.wait_for(t, timeout=_to)
+                    logger.info(
+                        "sip_listen_task_joined",
+                        message="UDP listen 루프 종료·소켓 close 완료",
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "sip_listen_task_join_timeout",
+                        timeout_sec=_to,
+                        message="listen 태스크 join 시간 초과 — 이후 단계 계속",
+                    )
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    logger.warning(
+                        "sip_listen_task_join_error",
+                        error=str(e),
+                        error_type=type(e).__name__,
+                    )
+            else:
+                try:
+                    exc = t.exception()
+                    if exc is not None:
+                        logger.debug(
+                            "sip_listen_task_done_with_exception",
+                            error=str(exc),
+                            error_type=type(exc).__name__,
+                        )
+                except asyncio.InvalidStateError:
+                    pass
+            self._listen_task = None
+
+        self._close_sip_traffic_log_file()
+        logger.info("sip_server_stopped")
+    
+    # =========================================================================
+    # Transfer (호 전환) 관련 메서드
+    # =========================================================================
+    
+    async def send_transfer_invite(
+        self,
+        call_id: str,
+        transfer_leg_call_id: str,
+        transfer_to: str,
+        caller_display: str = "",
+    ):
+        """Transfer INVITE 발신
+        
+        B2BUA에서 전환 대상에게 새로운 INVITE를 발신합니다.
+        SDP에는 서버의 미디어 포트를 넣어 미디어가 서버를 경유하도록 합니다.
+        
+        Args:
+            call_id: 원래 호 ID
+            transfer_leg_call_id: 전환 레그 Call-ID
+            transfer_to: 전환 대상 (SIP URI 또는 내선번호)
+            caller_display: 발신자 표시명
+        """
+        try:
+            # 1. 전환 대상 주소 해석 (Call Control `fwd:<uuid>` → 등록 내선)
+            effective_transfer = (transfer_to or "").strip()
+            original_call_info = self._active_calls.get(call_id)
+            rule_owner = (
+                (original_call_info or {}).get("callee_username") or ""
+            ).strip()
+            if effective_transfer.lower().startswith("fwd:"):
+                from src.call_control.forward_resolve import resolve_fwd_ref_to_registered_extension
+
+                if not rule_owner:
+                    logger.warning(
+                        "transfer_invite_fwd_missing_rule_owner",
+                        call_id=call_id,
+                        transfer_preview=effective_transfer[:48],
+                    )
+                else:
+                    picked = resolve_fwd_ref_to_registered_extension(
+                        effective_transfer,
+                        rule_owner=rule_owner,
+                        registered_extensions=self._registered_users.keys(),
+                        is_extension_busy=self._extension_has_active_call,
+                    )
+                    if picked:
+                        logger.info(
+                            "transfer_invite_fwd_resolved",
+                            call_id=call_id,
+                            rule_owner=rule_owner,
+                            picked=picked,
+                            note="KB·call-control fwd: 참조를 내선으로 치환",
+                        )
+                        effective_transfer = picked
+                    else:
+                        logger.warning(
+                            "transfer_invite_fwd_unresolved",
+                            call_id=call_id,
+                            rule_owner=rule_owner,
+                            transfer_preview=effective_transfer[:48],
+                        )
+
+            target_user, target_addr = self._resolve_transfer_target(effective_transfer)
+            if not target_addr:
+                raise ValueError(f"Cannot resolve transfer target: {transfer_to}")
+            
+            # 2. 미디어 포트 할당 (Bridge용 RTP/RTCP 쌍)
+            bridge_ports = self._port_pool.allocate_media_pair(transfer_leg_call_id)
+            
+            # 3. B2BUA IP 가져오기
+            b2bua_ip = self._get_b2bua_ip()
+            
+            # 4. SDP 구성 (서버의 미디어 정보)
+            # ✅ AI 200 OK SDP (검증 완료)와 동일한 형식 사용
+            # - s=Talk (단말 호환성 검증 완료)
+            # - PT 0/8은 well-known static type이므로 rtpmap 생략 (RFC 3551)
+            # - sendrecv는 기본값이므로 생략 (RFC 3264)
+            # - fmtp:101 생략 (검증된 형식과 일치)
+            import time as _time
+            session_id = str(int(_time.time()))
+            session_version = str(int(_time.time()))
+            
+            # 원래 호의 SDP에서 session 정보 추출 (가능하면) — 위에서 original_call_info 로드됨
+            # From URI user 부분이 비면 많은 단말이 400 Bad Request 반환
+            effective_caller = (caller_display or "").strip()
+            if not effective_caller and original_call_info:
+                cu = original_call_info.get("caller_username")
+                if isinstance(cu, str) and cu.strip():
+                    effective_caller = cu.strip()
+            if not effective_caller:
+                effective_caller = "caller"
+            if effective_caller != (caller_display or "").strip():
+                logger.info(
+                    "transfer_invite_caller_id_resolved",
+                    call_id=call_id,
+                    effective_caller=effective_caller,
+                    had_caller_display_param=bool((caller_display or "").strip()),
+                    note="Transfer INVITE From·sip:user@ — 비어 있으면 단말 400 거절 가능",
+                )
+
+            if original_call_info:
+                original_sdp = original_call_info.get('sdp', '')
+                if original_sdp:
+                    sdp_lines_orig = original_sdp.split('\r\n') if '\r\n' in original_sdp else original_sdp.split('\n')
+                    for line in sdp_lines_orig:
+                        if line.strip().startswith('o='):
+                            parts = line.strip().split()
+                            if len(parts) >= 3:
+                                session_id = parts[1]
+                                session_version = parts[2]
+                            break
+            
+            transfer_sdp = (
+                f"v=0\r\n"
+                f"o=- {session_id} {session_version} IN IP4 {b2bua_ip}\r\n"
+                f"s=Talk\r\n"
+                f"c=IN IP4 {b2bua_ip}\r\n"
+                f"t=0 0\r\n"
+                f"m=audio {bridge_ports[0]} RTP/AVP 0 8 101\r\n"
+                f"a=rtpmap:101 telephone-event/8000\r\n"
+                f"a=rtcp:{bridge_ports[1]}\r\n"
+            )
+            
+            # 5. From tag 생성
+            import random
+            from_tag = f"xfer-{random.randint(100000, 999999)}"
+            
+            # 6. INVITE 메시지 구성
+            via_branch = f"z9hG4bK-xfer-{random.randint(10000000, 99999999)}"
+            
+            invite_msg = (
+                f"INVITE sip:{target_user}@{target_addr[0]}:{target_addr[1]} SIP/2.0\r\n"
+                f"Via: SIP/2.0/UDP {b2bua_ip}:{self.config.sip.listen_port};branch={via_branch}\r\n"
+                f"Max-Forwards: 70\r\n"
+                f'From: "{effective_caller}" <sip:{effective_caller}@{b2bua_ip}>;tag={from_tag}\r\n'
+                f"To: <sip:{target_user}@{target_addr[0]}>\r\n"
+                f"Call-ID: {transfer_leg_call_id}\r\n"
+                f"CSeq: 1 INVITE\r\n"
+                f"Contact: <sip:{effective_caller}@{b2bua_ip}:{self.config.sip.listen_port}>\r\n"
+                f"Content-Type: application/sdp\r\n"
+                f"Content-Length: {len(transfer_sdp)}\r\n"
+                f"\r\n"
+                f"{transfer_sdp}"
+            )
+            
+            # 7. 전환 호 정보 저장
+            self._active_calls[transfer_leg_call_id] = {
+                'is_transfer': True,
+                'original_call_id': call_id,
+                'transfer_leg_call_id': transfer_leg_call_id,
+                'target_user': target_user,
+                'target_addr': target_addr,
+                'from_tag': from_tag,
+                'state': 'inviting',
+                'bridge_ports': bridge_ports,
+                'b2bua_call_id': transfer_leg_call_id,
+                'start_time': datetime.now(),
+            }
+            
+            # call_mapping에 추가 (응답 처리용)
+            self._call_mapping[transfer_leg_call_id] = transfer_leg_call_id
+            
+            # 8. INVITE 전송
+            self._socket.sendto(invite_msg.encode(), target_addr)
+            
+            logger.info("transfer_invite_sent",
+                       call_id=call_id,
+                       transfer_leg=transfer_leg_call_id,
+                       target=f"{target_user}@{target_addr[0]}:{target_addr[1]}",
+                       bridge_rtp_port=bridge_ports[0])
+            
+        except Exception as e:
+            logger.error("transfer_invite_send_error",
+                        call_id=call_id,
+                        transfer_to=transfer_to,
+                        error=str(e))
+            try:
+                self._port_pool.release_ports(transfer_leg_call_id)
+            except Exception:
+                pass
+            # TransferManager에 실패 통보
+            if hasattr(self, '_transfer_manager') and self._transfer_manager:
+                await self._transfer_manager.on_transfer_rejected(
+                    transfer_leg_call_id, 500, str(e))
+    
+    def _resolve_transfer_target(self, transfer_to: str):
+        """전환 대상 주소 해석
+        
+        Returns:
+            (username, (ip, port)) tuple
+        """
+        # SIP URI 형식
+        if transfer_to.startswith("sip:"):
+            # sip:user@host:port 또는 sip:user@host
+            uri_part = transfer_to[4:]  # "sip:" 제거
+            if '@' in uri_part:
+                user, host_part = uri_part.split('@', 1)
+                if ':' in host_part:
+                    host, port = host_part.split(':', 1)
+                    return (user, (host, int(port)))
+                else:
+                    # 등록된 사용자 확인
+                    if user in self._registered_users:
+                        reg = self._registered_users[user]
+                        return (user, (reg['ip'], reg['port']))
+                    return (user, (host_part, 5060))
+        
+        # 내선번호 (숫자만)
+        if transfer_to.isdigit() or transfer_to.replace('-', '').isdigit():
+            clean_number = transfer_to.replace('-', '')
+            if clean_number in self._registered_users:
+                reg = self._registered_users[clean_number]
+                return (clean_number, (reg['ip'], reg['port']))
+            
+            logger.warning("transfer_target_not_registered",
+                          extension=clean_number)
+            return (clean_number, None)
+        
+        # 기타 형식
+        logger.warning("transfer_target_unknown_format", transfer_to=transfer_to)
+        return (transfer_to, None)
+    
+    async def send_transfer_cancel(self, transfer_leg_call_id: str):
+        """Transfer CANCEL 전송"""
+        try:
+            call_info = self._active_calls.get(transfer_leg_call_id)
+            if not call_info or not call_info.get('is_transfer'):
+                return
+            
+            target_addr = call_info.get('target_addr')
+            if not target_addr:
+                return
+            
+            b2bua_ip = self._get_b2bua_ip()
+            from_tag = call_info.get('from_tag', '')
+            target_user = call_info.get('target_user', '')
+            
+            cancel_msg = (
+                f"CANCEL sip:{target_user}@{target_addr[0]}:{target_addr[1]} SIP/2.0\r\n"
+                f"Via: SIP/2.0/UDP {b2bua_ip}:{self.config.sip.listen_port};branch=z9hG4bK-xfer-cancel\r\n"
+                f"Max-Forwards: 70\r\n"
+                f"From: <sip:{b2bua_ip}>;tag={from_tag}\r\n"
+                f"To: <sip:{target_user}@{target_addr[0]}>\r\n"
+                f"Call-ID: {transfer_leg_call_id}\r\n"
+                f"CSeq: 1 CANCEL\r\n"
+                f"Content-Length: 0\r\n"
+                f"\r\n"
+            )
+            
+            self._socket.sendto(cancel_msg.encode(), target_addr)
+            logger.info("transfer_cancel_sent", transfer_leg=transfer_leg_call_id)
+            
+        except Exception as e:
+            logger.error("transfer_cancel_error",
+                        transfer_leg=transfer_leg_call_id, error=str(e))
+    
+    async def send_transfer_bye(self, leg_call_id: str):
+        """Transfer BYE 전송"""
+        try:
+            call_info = self._active_calls.get(leg_call_id)
+            if not call_info:
+                return
+            
+            target_addr = call_info.get('target_addr')
+            if not target_addr:
+                return
+            
+            b2bua_ip = self._get_b2bua_ip()
+            from_tag = call_info.get('from_tag', '')
+            callee_tag = call_info.get('callee_tag', '')
+            target_user = call_info.get('target_user', '')
+            
+            bye_msg = (
+                f"BYE sip:{target_user}@{target_addr[0]}:{target_addr[1]} SIP/2.0\r\n"
+                f"Via: SIP/2.0/UDP {b2bua_ip}:{self.config.sip.listen_port};branch=z9hG4bK-xfer-bye\r\n"
+                f"Max-Forwards: 70\r\n"
+                f"From: <sip:{b2bua_ip}>;tag={from_tag}\r\n"
+                f"To: <sip:{target_user}@{target_addr[0]}>"
+                f"{';tag=' + callee_tag if callee_tag else ''}\r\n"
+                f"Call-ID: {leg_call_id}\r\n"
+                f"CSeq: 2 BYE\r\n"
+                f"Content-Length: 0\r\n"
+                f"\r\n"
+            )
+            
+            self._socket.sendto(bye_msg.encode(), target_addr)
+            logger.info("transfer_bye_sent", leg_call_id=leg_call_id)
+            
+            # 정리
+            self._active_calls.pop(leg_call_id, None)
+            self._call_mapping.pop(leg_call_id, None)
+            
+        except Exception as e:
+            logger.error("transfer_bye_error",
+                        leg_call_id=leg_call_id, error=str(e))
+    
+    async def handle_transfer_response(self, response: str, addr: tuple, call_info: dict):
+        """Transfer 레그의 SIP 응답 처리
+        
+        _handle_sip_response에서 transfer 레그로 판별된 경우 호출됩니다.
+        """
+        lines = response.split('\r\n')
+        status_line = lines[0]
+        parts = status_line.split()
+        status_code = int(parts[1])
+        transfer_leg_call_id = call_info['transfer_leg_call_id']
+        
+        if not hasattr(self, '_transfer_manager') or not self._transfer_manager:
+            logger.warning("transfer_manager_not_set")
+            return
+        
+        if status_code in (180, 183):
+            # Provisional
+            to_hdr = self._extract_header(response, 'To')
+            callee_tag = self._extract_tag(to_hdr)
+            if callee_tag:
+                call_info['callee_tag'] = callee_tag
+            
+            await self._transfer_manager.on_transfer_provisional(
+                transfer_leg_call_id, status_code)
+        
+        elif status_code == 200:
+            # 200 OK → 착신자 응답
+            to_hdr = self._extract_header(response, 'To')
+            callee_tag = self._extract_tag(to_hdr)
+            if callee_tag:
+                call_info['callee_tag'] = callee_tag
+            call_info['state'] = 'answered'
+            
+            # SDP 추출
+            callee_sdp = self._extract_sdp_body(response)
+            
+            # ACK 전송
+            await self._send_transfer_ack(call_info, addr)
+            
+            # TransferManager에 통보
+            await self._transfer_manager.on_transfer_answered(
+                transfer_leg_call_id, callee_sdp or "")
+        
+        elif status_code >= 300:
+            # Error/Reject
+            reason = parts[2] if len(parts) > 2 else "Unknown"
+            
+            # ACK for non-2xx
+            await self._send_transfer_ack(call_info, addr)
+            
+            await self._transfer_manager.on_transfer_rejected(
+                transfer_leg_call_id, status_code, reason)
+            
+            # 정리
+            self._active_calls.pop(transfer_leg_call_id, None)
+            self._call_mapping.pop(transfer_leg_call_id, None)
+            try:
+                self._port_pool.release_ports(transfer_leg_call_id)
+            except Exception:
+                pass
+    
+    async def _send_transfer_ack(self, call_info: dict, addr: tuple):
+        """Transfer 레그에 ACK 전송"""
+        try:
+            transfer_leg_call_id = call_info['transfer_leg_call_id']
+            target_user = call_info.get('target_user', '')
+            target_addr = call_info.get('target_addr', addr)
+            from_tag = call_info.get('from_tag', '')
+            callee_tag = call_info.get('callee_tag', '')
+            b2bua_ip = self._get_b2bua_ip()
+            
+            ack_msg = (
+                f"ACK sip:{target_user}@{target_addr[0]}:{target_addr[1]} SIP/2.0\r\n"
+                f"Via: SIP/2.0/UDP {b2bua_ip}:{self.config.sip.listen_port};branch=z9hG4bK-xfer-ack\r\n"
+                f"Max-Forwards: 70\r\n"
+                f"From: <sip:{b2bua_ip}>;tag={from_tag}\r\n"
+                f"To: <sip:{target_user}@{target_addr[0]}>"
+                f"{';tag=' + callee_tag if callee_tag else ''}\r\n"
+                f"Call-ID: {transfer_leg_call_id}\r\n"
+                f"CSeq: 1 ACK\r\n"
+                f"Content-Length: 0\r\n"
+                f"\r\n"
+            )
+            
+            self._socket.sendto(ack_msg.encode(), target_addr)
+            logger.info("transfer_ack_sent", transfer_leg=transfer_leg_call_id)
+            
+        except Exception as e:
+            logger.error("transfer_ack_error", error=str(e))
+    
+    async def switch_to_bridge_mode(
+        self, call_id: str, transfer_leg_call_id: str, callee_sdp: str
+    ):
+        """RTP Relay를 Bridge 모드로 전환
+        
+        AI 모드에서 Bridge 모드로 전환하여 발신자↔서버↔착신자 미디어 경로를 구성합니다.
+        """
+        try:
+            from src.media.sdp_parser import SDPParser
+            
+            # 착신자 SDP 파싱 → 미디어 엔드포인트 확인
+            callee_ip = None
+            callee_rtp_port = None
+            
+            if callee_sdp:
+                parsed_sdp = SDPParser.parse(callee_sdp)
+                if parsed_sdp:
+                    callee_ip = parsed_sdp.connection_ip
+                    if parsed_sdp.media_descriptions:
+                        for md in parsed_sdp.media_descriptions:
+                            if md.media_type == "audio":
+                                callee_rtp_port = md.port
+                                break
+            
+            # Transfer call_info에서 bridge 포트 가져오기
+            xfer_info = self._active_calls.get(transfer_leg_call_id)
+            if not xfer_info:
+                logger.error("transfer_call_info_not_found",
+                            transfer_leg=transfer_leg_call_id)
+                return
+            
+            bridge_ports = xfer_info.get('bridge_ports', [])
+            if not bridge_ports:
+                logger.error("bridge_ports_not_found",
+                            transfer_leg=transfer_leg_call_id)
+                return
+            
+            bridge_rtp_port = bridge_ports[0]
+            
+            if not callee_ip or not callee_rtp_port:
+                # SDP 파싱 실패 시 전환 대상 주소 사용
+                target_addr = xfer_info.get('target_addr')
+                if target_addr:
+                    callee_ip = target_addr[0]
+                    callee_rtp_port = bridge_rtp_port  # 기본값
+            
+            # RTP Worker에서 Bridge 모드 활성화
+            rtp_worker = self._rtp_workers.get(call_id)
+            if rtp_worker:
+                await rtp_worker.set_bridge_mode(
+                    callee_ip=callee_ip,
+                    callee_rtp_port=callee_rtp_port,
+                    bridge_rtp_port=bridge_rtp_port,
+                )
+                
+                logger.info("bridge_mode_established",
+                           call_id=call_id,
+                           callee=f"{callee_ip}:{callee_rtp_port}",
+                           bridge_port=bridge_rtp_port)
+                logger.info(
+                    "dock_transfer_caller_leg_media_anchor",
+                    call_id=call_id,
+                    note="발신↔B2BUA RTP 앵커 유지·브릿지로 새 착신 연결 — 단말 REINVITE는 옵션(동일 포트 시 생략 가능)",
+                )
+            else:
+                logger.error("rtp_worker_not_found_for_bridge",
+                            call_id=call_id)
+            
+        except Exception as e:
+            logger.error("switch_to_bridge_error",
+                        call_id=call_id, error=str(e))
+
+    async def set_dock_hold(self, call_id: str, enable: bool) -> bool:
+        """Call Dock 「통화대기」: RTP 릴레이에 양측 대기음(MOH) 주입."""
+        rtp_worker = self._rtp_workers.get(call_id)
+        if not rtp_worker:
+            logger.warning("dock_hold_no_rtp_worker", call_id=call_id, enable=enable)
+            return False
+        try:
+            if enable:
+                await rtp_worker.start_dock_hold_moh()
+            else:
+                await rtp_worker.stop_dock_hold_moh()
+            return True
+        except Exception as e:
+            logger.error("dock_hold_toggle_failed", call_id=call_id, enable=enable, error=str(e))
+            return False
+    
+    # =========================================================================
+    # Outbound Call 관련 메서드
+    # =========================================================================
+    
+    async def send_outbound_invite(
+        self,
+        to_number: str,
+        from_number: str,
+        from_display: str = "",
+        outbound_id: str = "",
+    ) -> str:
+        """아웃바운드 콜 SIP INVITE 발신
+        
+        B2BUA에서 외부 번호로 직접 INVITE를 발신합니다.
+        SDP에는 서버의 미디어 포트를 넣어 AI 모드로 통화합니다.
+        
+        Args:
+            to_number: 착신번호
+            from_number: 발신번호
+            from_display: 발신자 표시명
+            outbound_id: 아웃바운드 콜 ID
+            
+        Returns:
+            생성된 Call-ID
+        """
+        try:
+            # 1. 대상 주소 해석
+            target_user, target_addr = self._resolve_outbound_target(to_number)
+            if not target_addr:
+                raise ValueError(f"Cannot resolve outbound target: {to_number}")
+            
+            # 2. Call-ID 생성 (포트 풀 키로 사용)
+            import random
+            call_id = f"outbound-{outbound_id}-{random.randint(10000000, 99999999)}"
+            
+            # 3. 미디어 포트 할당 (AI 모드용 RTP/RTCP 쌍)
+            media_ports = self._port_pool.allocate_media_pair(call_id)
+            
+            # 4. B2BUA IP
+            b2bua_ip = self._get_b2bua_ip()
+            
+            # 5. SDP 구성 (검증된 AI 200 OK / Transfer INVITE와 동일한 형식)
+            import time as _time
+            session_id = str(int(_time.time()))
+            
+            outbound_sdp = (
+                f"v=0\r\n"
+                f"o=- {session_id} {session_id} IN IP4 {b2bua_ip}\r\n"
+                f"s=Talk\r\n"
+                f"c=IN IP4 {b2bua_ip}\r\n"
+                f"t=0 0\r\n"
+                f"m=audio {media_ports[0]} RTP/AVP 0 8 101\r\n"
+                f"a=rtpmap:101 telephone-event/8000\r\n"
+                f"a=rtcp:{media_ports[1]}\r\n"
+            )
+            
+            # 6. From tag
+            from_tag = f"ob-{random.randint(100000, 999999)}"
+
+            # 7. INVITE 메시지 구성
+            # via_branch는 CANCEL 재사용을 위해 call_info에 저장한다 (RFC 3261 §9.1)
+            via_branch = f"z9hG4bK-ob-{random.randint(10000000, 99999999)}"
+            display_name = from_display or from_number
+            invite_cseq = 1  # 이후 re-INVITE/BYE 에서 증가하여 사용
+
+            invite_msg = (
+                f"INVITE sip:{target_user}@{target_addr[0]}:{target_addr[1]} SIP/2.0\r\n"
+                f"Via: SIP/2.0/UDP {b2bua_ip}:{self.config.sip.listen_port};branch={via_branch}\r\n"
+                f"Max-Forwards: 70\r\n"
+                f'From: "{display_name}" <sip:{from_number}@{b2bua_ip}>;tag={from_tag}\r\n'
+                f"To: <sip:{target_user}@{target_addr[0]}>\r\n"
+                f"Call-ID: {call_id}\r\n"
+                f"CSeq: {invite_cseq} INVITE\r\n"
+                f"Contact: <sip:{from_number}@{b2bua_ip}:{self.config.sip.listen_port}>\r\n"
+                f"Allow: INVITE, ACK, CANCEL, OPTIONS, BYE, REFER, NOTIFY, INFO, UPDATE\r\n"
+                f"Supported: replaces, outbound\r\n"
+                f"Content-Type: application/sdp\r\n"
+                f"Content-Length: {len(outbound_sdp)}\r\n"
+                f"X-Outbound-Call-ID: {outbound_id}\r\n"
+                f"\r\n"
+                f"{outbound_sdp}"
+            )
+
+            # 8. 호 정보 저장
+            # invite_via_branch: CANCEL에서 반드시 동일 branch 재사용 (RFC 3261 §9.1)
+            # invite_cseq: BYE CSeq = invite_cseq + 1 + (re-INVITE 횟수) 계산 기준
+            self._active_calls[call_id] = {
+                'is_outbound': True,
+                'outbound_id': outbound_id,
+                'call_id': call_id,
+                'target_user': target_user,
+                'target_addr': target_addr,
+                'from_tag': from_tag,
+                'from_number': from_number,
+                'to_number': to_number,
+                'state': 'inviting',
+                'media_ports': media_ports,
+                'b2bua_call_id': call_id,
+                'start_time': datetime.now(),
+                'sdp': outbound_sdp,
+                'invite_via_branch': via_branch,
+                'invite_cseq': invite_cseq,
+                'current_cseq': invite_cseq,  # re-INVITE 시 증가
+            }
+            
+            # call_mapping에 추가
+            self._call_mapping[call_id] = call_id
+            
+            # 9. 전송
+            self._socket.sendto(invite_msg.encode(), target_addr)
+            
+            logger.info("outbound_invite_sent",
+                       call_id=call_id,
+                       outbound_id=outbound_id,
+                       target=f"{target_user}@{target_addr[0]}:{target_addr[1]}",
+                       media_rtp_port=media_ports[0])
+            
+            return call_id
+            
+        except Exception as e:
+            logger.error("outbound_invite_send_error",
+                        to_number=to_number,
+                        outbound_id=outbound_id,
+                        error=str(e))
+            cid = locals().get("call_id")
+            if cid:
+                try:
+                    self._port_pool.release_ports(cid)
+                except Exception:
+                    pass
+            raise
+    
+    def _resolve_outbound_target(self, number: str):
+        """아웃바운드 대상 주소 해석
+        
+        Returns:
+            (username, (ip, port)) tuple
+        """
+        # 1. 등록된 유저 확인 (내선번호)
+        clean_number = number.replace('-', '').replace(' ', '')
+        if clean_number in self._registered_users:
+            reg = self._registered_users[clean_number]
+            return (clean_number, (reg['ip'], reg['port']))
+        
+        # 2. SIP URI 형식
+        if number.startswith("sip:"):
+            uri_part = number[4:]
+            if '@' in uri_part:
+                user, host_part = uri_part.split('@', 1)
+                if ':' in host_part:
+                    host, port = host_part.split(':', 1)
+                    return (user, (host, int(port)))
+                return (user, (host_part, 5060))
+        
+        # 3. SIP Gateway 사용 (외부 번호)
+        outbound_config = {}
+        if hasattr(self.config, 'ai_voicebot') and self.config.ai_voicebot:
+            ob = getattr(self.config.ai_voicebot, 'outbound', None)
+            if ob:
+                outbound_config = ob if isinstance(ob, dict) else ob.model_dump() if hasattr(ob, 'model_dump') else {}
+        
+        gateway = outbound_config.get('default_gateway')
+        if gateway:
+            if gateway.startswith("sip:"):
+                gateway = gateway[4:]
+            if ':' in gateway:
+                host, port = gateway.rsplit(':', 1)
+                return (clean_number, (host, int(port)))
+            return (clean_number, (gateway, 5060))
+        
+        logger.warning("outbound_target_unresolved",
+                       number=number,
+                       hint="Set default_gateway in config or register the number")
+        return (clean_number, None)
+    
+    async def send_outbound_cancel(self, call_id: str):
+        """아웃바운드 콜 CANCEL 전송
+
+        RFC 3261 §9.1: CANCEL은 취소 대상 INVITE 트랜잭션과
+        동일한 Via branch·From·To·Call-ID·CSeq(번호만 같고 method=CANCEL)를 사용해야 한다.
+        """
+        try:
+            call_info = self._active_calls.get(call_id)
+            if not call_info or not call_info.get('is_outbound'):
+                return
+
+            target_addr = call_info.get('target_addr')
+            if not target_addr:
+                return
+
+            b2bua_ip = self._get_b2bua_ip()
+            from_tag = call_info.get('from_tag', '')
+            target_user = call_info.get('target_user', '')
+            from_number = call_info.get('from_number', '')
+            # RFC 3261: CANCEL Via branch = INVITE Via branch (동일 트랜잭션)
+            via_branch = call_info.get('invite_via_branch') or f"z9hG4bK-ob-cancel-{from_tag}"
+            invite_cseq = call_info.get('invite_cseq', 1)
+            callee_tag = call_info.get('callee_tag', '')
+
+            cancel_msg = (
+                f"CANCEL sip:{target_user}@{target_addr[0]}:{target_addr[1]} SIP/2.0\r\n"
+                f"Via: SIP/2.0/UDP {b2bua_ip}:{self.config.sip.listen_port};branch={via_branch}\r\n"
+                f"Max-Forwards: 70\r\n"
+                f'From: "{from_number}" <sip:{from_number}@{b2bua_ip}>;tag={from_tag}\r\n'
+                f"To: <sip:{target_user}@{target_addr[0]}>"
+                f"{';tag=' + callee_tag if callee_tag else ''}\r\n"
+                f"Call-ID: {call_id}\r\n"
+                f"CSeq: {invite_cseq} CANCEL\r\n"
+                f"Content-Length: 0\r\n"
+                f"\r\n"
+            )
+
+            self._socket.sendto(cancel_msg.encode(), target_addr)
+            logger.info("outbound_cancel_sent", call_id=call_id,
+                        via_branch=via_branch, cseq=invite_cseq)
+
+        except Exception as e:
+            logger.error("outbound_cancel_error", call_id=call_id, error=str(e))
+    
+    async def send_outbound_bye(self, call_id: str):
+        """아웃바운드 콜 BYE 전송
+
+        BYE CSeq = current_cseq + 1 (이전 INVITE/re-INVITE 다음 값).
+        BYE는 새 트랜잭션이므로 Via branch는 새로 생성한다.
+        """
+        try:
+            call_info = self._active_calls.get(call_id)
+            if not call_info:
+                return
+
+            target_addr = call_info.get('target_addr')
+            if not target_addr:
+                return
+
+            b2bua_ip = self._get_b2bua_ip()
+            from_tag = call_info.get('from_tag', '')
+            callee_tag = call_info.get('callee_tag', '')
+            target_user = call_info.get('target_user', '')
+            from_number = call_info.get('from_number', '')
+
+            # BYE는 새 트랜잭션 → 새 branch
+            via_branch = f"z9hG4bK-ob-bye-{random.randint(10000000, 99999999)}"
+            # CSeq는 현재까지 사용한 최대값+1 (re-INVITE가 있으면 current_cseq가 이미 증가)
+            bye_cseq = call_info.get('current_cseq', 1) + 1
+            call_info['current_cseq'] = bye_cseq
+
+            bye_msg = (
+                f"BYE sip:{target_user}@{target_addr[0]}:{target_addr[1]} SIP/2.0\r\n"
+                f"Via: SIP/2.0/UDP {b2bua_ip}:{self.config.sip.listen_port};branch={via_branch}\r\n"
+                f"Max-Forwards: 70\r\n"
+                f'From: "{from_number}" <sip:{from_number}@{b2bua_ip}>;tag={from_tag}\r\n'
+                f"To: <sip:{target_user}@{target_addr[0]}>"
+                f"{';tag=' + callee_tag if callee_tag else ''}\r\n"
+                f"Call-ID: {call_id}\r\n"
+                f"CSeq: {bye_cseq} BYE\r\n"
+                f"Content-Length: 0\r\n"
+                f"\r\n"
+            )
+
+            self._socket.sendto(bye_msg.encode(), target_addr)
+            logger.info("outbound_bye_sent", call_id=call_id, cseq=bye_cseq)
+
+            # 🎙️ 아웃바운드 녹음 종료 (봇이 BYE를 먼저 보내는 경우)
+            _sip_rec = getattr(self._call_manager, 'sip_recorder', None) if self._call_manager else None
+            if _sip_rec and _sip_rec.is_recording(call_id):
+                try:
+                    asyncio.create_task(_sip_rec.stop_recording(call_id))
+                    logger.info("outbound_recording_stopped_on_send_bye", call_id=call_id)
+                except Exception as _rec_err:
+                    logger.error("outbound_recording_stop_error_on_send_bye",
+                                 call_id=call_id, error=str(_rec_err))
+
+            # 정리
+            self._active_calls.pop(call_id, None)
+            self._call_mapping.pop(call_id, None)
+
+        except Exception as e:
+            logger.error("outbound_bye_error", call_id=call_id, error=str(e))
+    
+    async def handle_outbound_response(self, response: str, addr: tuple, call_info: dict):
+        """아웃바운드 콜의 SIP 응답 처리"""
+        lines = response.split('\r\n')
+        status_line = lines[0]
+        parts = status_line.split()
+        status_code = int(parts[1])
+        call_id = call_info['call_id']
+        
+        if not hasattr(self, '_outbound_manager') or not self._outbound_manager:
+            logger.warning("outbound_manager_not_set")
+            return
+        
+        if status_code in (100,):
+            # 100 Trying - ignore
+            return
+        
+        elif status_code in (180, 183):
+            # Provisional
+            to_hdr = self._extract_header(response, 'To')
+            callee_tag = self._extract_tag(to_hdr)
+            if callee_tag:
+                call_info['callee_tag'] = callee_tag
+            
+            await self._outbound_manager.on_provisional(call_id, status_code)
+        
+        elif status_code == 200:
+            # 200 OK → 착신자 응답
+            to_hdr = self._extract_header(response, 'To')
+            callee_tag = self._extract_tag(to_hdr)
+            if callee_tag:
+                call_info['callee_tag'] = callee_tag
+            call_info['state'] = 'answered'
+
+            # SDP 추출
+            callee_sdp = self._extract_sdp_body(response)
+
+            # ACK 전송
+            await self._send_outbound_ack(call_info, addr)
+
+            # RTP Worker 생성 (아웃바운드 전용 — 미디어 포트는 INVITE 시 할당됨)
+            await self._start_outbound_rtp_worker(call_id, call_info, callee_sdp or "")
+
+            # OutboundCallManager에 통보 (RTP Worker 준비 후 AI 파이프라인 기동)
+            await self._outbound_manager.on_answered(call_id, callee_sdp or "")
+        
+        elif status_code >= 300:
+            # Error/Reject
+            reason = ' '.join(parts[2:]) if len(parts) > 2 else "Unknown"
+            
+            # ACK for non-2xx
+            await self._send_outbound_ack(call_info, addr)
+            
+            await self._outbound_manager.on_rejected(call_id, status_code, reason)
+            
+            # 정리
+            self._active_calls.pop(call_id, None)
+            self._call_mapping.pop(call_id, None)
+    
+    async def _send_outbound_ack(self, call_info: dict, addr: tuple):
+        """아웃바운드 콜에 ACK 전송"""
+        try:
+            call_id = call_info['call_id']
+            target_user = call_info.get('target_user', '')
+            target_addr = call_info.get('target_addr', addr)
+            from_tag = call_info.get('from_tag', '')
+            callee_tag = call_info.get('callee_tag', '')
+            from_number = call_info.get('from_number', '')
+            b2bua_ip = self._get_b2bua_ip()
+            
+            import random
+            via_branch = f"z9hG4bK-ob-ack-{random.randint(10000000, 99999999)}"
+            
+            ack_msg = (
+                f"ACK sip:{target_user}@{target_addr[0]}:{target_addr[1]} SIP/2.0\r\n"
+                f"Via: SIP/2.0/UDP {b2bua_ip}:{self.config.sip.listen_port};branch={via_branch}\r\n"
+                f"Max-Forwards: 70\r\n"
+                f"From: <sip:{from_number}@{b2bua_ip}>;tag={from_tag}\r\n"
+                f"To: <sip:{target_user}@{target_addr[0]}>"
+                f"{';tag=' + callee_tag if callee_tag else ''}\r\n"
+                f"Call-ID: {call_id}\r\n"
+                f"CSeq: 1 ACK\r\n"
+                f"Content-Length: 0\r\n"
+                f"\r\n"
+            )
+            
+            self._socket.sendto(ack_msg.encode(), target_addr)
+            logger.info("outbound_ack_sent", call_id=call_id)
+
+        except Exception as e:
+            logger.error("outbound_ack_error", error=str(e))
+
+    async def _start_outbound_rtp_worker(
+        self,
+        call_id: str,
+        call_info: dict,
+        callee_sdp: str,
+    ) -> bool:
+        """아웃바운드 통화 전용 RTP Worker 생성·시작.
+
+        send_outbound_invite에서 할당한 미디어 포트(call_info['media_ports'])를 기반으로
+        RTPRelayWorker를 만들어 _rtp_workers에 등록한다.
+        착신자 SDP에서 RTP 수신 주소를 파싱해 callee_endpoint를 설정한다.
+        Worker는 AI 모드(ai_mode=True)로 기동 — Pipecat 파이프라인이 이후 enable_pipecat_mode()를 호출한다.
+        """
+        try:
+            if call_id in self._rtp_workers:
+                logger.info("outbound_rtp_worker_already_exists", call_id=call_id)
+                return True
+
+            media_ports = call_info.get('media_ports')
+            if not media_ports or len(media_ports) < 2:
+                logger.error("outbound_rtp_worker_no_media_ports",
+                             call_id=call_id,
+                             note="send_outbound_invite에서 포트 할당 실패")
+                return False
+
+            b2bua_ip = self._get_b2bua_ip()
+
+            # B2BUA가 사용할 RTP 포트 (INVITE SDP에 넣었던 포트)
+            local_rtp_port = media_ports[0]
+            local_rtcp_port = media_ports[1]
+
+            # 착신자 SDP에서 RTP 수신 주소·포트 파싱
+            callee_ip = b2bua_ip
+            callee_rtp_port = 0
+            if callee_sdp:
+                for line in callee_sdp.splitlines():
+                    line = line.strip()
+                    if line.startswith("c=IN IP4 "):
+                        callee_ip = line.split()[-1]
+                    elif line.startswith("m=audio "):
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            try:
+                                callee_rtp_port = int(parts[1])
+                            except ValueError:
+                                pass
+
+            if not callee_rtp_port:
+                logger.warning("outbound_rtp_worker_no_callee_rtp_port",
+                               call_id=call_id,
+                               note="착신자 SDP에서 RTP 포트 파싱 실패 — 더미 포트 사용")
+                callee_rtp_port = 0
+
+            # MediaSession 생성 (아웃바운드 전용 경량 객체)
+            from src.media.media_session import MediaSession, MediaLeg
+            media_session = MediaSession(call_id=call_id)
+            # caller_leg: B2BUA → 착신자 방향 (실제 RTP 수신은 없음 — AI가 생성)
+            media_session.caller_leg = MediaLeg()
+            media_session.caller_leg.original_ip = callee_ip
+            media_session.caller_leg.original_audio_port = local_rtp_port
+            media_session.caller_leg.allocated_ports = [local_rtp_port, local_rtcp_port]
+            # callee_leg: 착신자 방향
+            # ai_mode=True 에서는 callee 소켓을 직접 바인드할 필요 없음.
+            # allocated_ports=[0,0]으로 설정하면 rtp_relay.start()에서
+            # get_audio_rtp_port()→0 반환 → 바인딩 스킵.
+            # 동일 포트를 두 번 바인드하는 [WinError 10048] 방지.
+            media_session.callee_leg = MediaLeg()
+            media_session.callee_leg.original_ip = callee_ip
+            media_session.callee_leg.original_audio_port = callee_rtp_port
+            media_session.callee_leg.allocated_ports = [0, 0]
+            media_session.caller_identity = str(call_info.get("from_number") or "").strip()
+            media_session.callee_identity = str(call_info.get("to_number") or "").strip()
+
+            # Outbound 콜 RTP 엔드포인트 설정.
+            # caller_endpoint: B2BUA 자신이 bind한 로컬 포트(local_rtp_port) — RTP 소켓의 bind 기준점.
+            # callee_endpoint: 착신자가 SDP에서 협상한 수신 포트(callee_rtp_port) — 실제 TTS 전송 대상.
+            # tts_dest_endpoint: enable_pipecat_mode / _pcm_sender_thread_main에서 사용하는 명시적 전송 목적지.
+            #   → Inbound와 동일하게 caller_endpoint를 RTP Worker 내부 로직의 기준으로 두되,
+            #     실제 TTS 패킷은 tts_dest_endpoint(= callee_rtp_port)로 전송한다.
+            caller_endpoint = RTPEndpoint(ip=callee_ip, port=local_rtp_port)
+            callee_endpoint = RTPEndpoint(
+                ip=callee_ip,
+                port=callee_rtp_port if callee_rtp_port else local_rtp_port,
+            )
+            # TTS RTP 실제 목적지: 착신자(수신 전화기)의 RTP 포트
+            tts_dest_endpoint = RTPEndpoint(
+                ip=callee_ip,
+                port=callee_rtp_port if callee_rtp_port else local_rtp_port,
+            )
+
+            rtp_bind_ip = getattr(self.config.media, 'rtp_bind_ip', None) or b2bua_ip
+            sip_recorder = self._call_manager.sip_recorder if self._call_manager else None
+
+            rtp_worker = RTPRelayWorker(
+                media_session=media_session,
+                caller_endpoint=caller_endpoint,
+                callee_endpoint=callee_endpoint,
+                bind_ip=rtp_bind_ip,
+                ai_orchestrator=None,  # Pipecat 경로 — orchestrator 직접 연결 불필요
+                sip_recorder=sip_recorder,
+                rtp_tx_debug=bool(getattr(self.config.media, "rtp_tx_debug", False)),
+                rtp_tx_debug_path=getattr(self.config.media, "rtp_tx_debug_path", None),
+                ai_rtp_silence_keepalive=bool(
+                    getattr(self.config.media, "ai_rtp_silence_keepalive", True)
+                ),
+                ai_rtp_keepalive_interval_sec=float(
+                    getattr(self.config.media, "ai_rtp_keepalive_interval_sec", 8.0)
+                ),
+                ai_rtp_adaptive_interval_enabled=bool(
+                    getattr(self.config.media, "ai_rtp_adaptive_interval", {}).get("enabled", True)
+                ),
+                ai_rtp_adaptive_interval_thresholds=getattr(
+                    self.config.media, "ai_rtp_adaptive_interval", {}
+                ).get("thresholds", None),
+            )
+
+            # 아웃바운드는 처음부터 AI 모드 — 릴레이할 caller/callee 실제 통화 없음
+            rtp_worker.ai_mode = True
+            # TTS 패킷의 실제 UDP 목적지를 착신자 포트로 고정
+            rtp_worker.tts_dest_endpoint = tts_dest_endpoint
+
+            await rtp_worker.start()
+            self._rtp_workers[call_id] = rtp_worker
+
+            logger.info("outbound_rtp_worker_started",
+                        call_id=call_id,
+                        bind_ip=rtp_bind_ip,
+                        local_rtp_port=local_rtp_port,
+                        callee_ip=callee_ip,
+                        callee_rtp_port=callee_rtp_port,
+                        tts_dest=f"{callee_ip}:{callee_rtp_port}")
+
+            # 🎙️ 아웃바운드 녹음 시작 (_start_rtp_relay와 동일 패턴)
+            if sip_recorder:
+                caller_id = call_info.get("from_number", "unknown")
+                callee_id = call_info.get("to_number", "unknown")
+                try:
+                    await sip_recorder.start_recording(
+                        call_id=call_id,
+                        caller_id=caller_id,
+                        callee_id=callee_id,
+                        direction="outbound",
+                    )
+                    logger.info("outbound_recording_started",
+                                call_id=call_id,
+                                caller=caller_id,
+                                callee=callee_id)
+                except Exception as rec_err:
+                    logger.error("outbound_recording_start_error",
+                                 call_id=call_id, error=str(rec_err))
+
+            return True
+
+        except Exception as e:
+            logger.error("outbound_rtp_worker_error",
+                         call_id=call_id, error=str(e), exc_info=True)
+            return False
+
+    def is_running(self) -> bool:
+        """서버 실행 중 여부"""
+        return self._running
+
+    # ── Ringback Player 헬퍼 ────────────────────────────────────────────────
+
+    def _resolve_owner(self) -> str:
+        """owner 식별자 반환 (config 또는 기본값)."""
+        return (
+            getattr(self, "_owner", None)
+            or getattr(getattr(self, "config", None), "owner", None)
+            or "pbx"
+        )
+
+    async def _start_ringback_player(self, call_id: str, owner: str) -> None:
+        """ringback_settings를 확인하고 활성화된 경우 RingbackPlayer를 시작한다."""
+        try:
+            from src.services.ringback_service import get_effective_ringback_settings_for_player
+            from src.sip_core.ringback_player import RingbackPlayer
+
+            settings = get_effective_ringback_settings_for_player(owner)
+            if not settings:
+                logger.info(
+                    "ringback_start_skipped",
+                    call_id=call_id,
+                    owner=owner,
+                    reason="no_ringback_settings_or_playable_segment",
+                    hint="ringback_settings 행 없고 스케줄/로컬 MP3도 없으면 링백을 시작하지 않습니다. 설정 UI에서 owner별 저장 또는 스케줄 할당을 추가하세요.",
+                )
+                return
+            eg = bool(settings.get("enabled_greeting"))
+            er = bool(settings.get("enabled_ringback"))
+            if not eg and not er:
+                logger.info(
+                    "ringback_start_skipped",
+                    call_id=call_id,
+                    owner=owner,
+                    reason="greeting_and_ringback_disabled",
+                    enabled_greeting=settings.get("enabled_greeting"),
+                    enabled_ringback=settings.get("enabled_ringback"),
+                )
+                return
+
+            rtp_worker = self._rtp_workers.get(call_id)
+            if not rtp_worker:
+                logger.warning("ringback_no_rtp_worker", call_id=call_id)
+                return
+
+            player = RingbackPlayer()
+            self._ringback_players[call_id] = player
+            await player.start(rtp_worker, owner, call_id)
+            logger.info("ringback_player_attached", call_id=call_id, owner=owner)
+        except Exception as e:
+            logger.error("ringback_player_start_error", call_id=call_id, error=str(e), exc_info=True)
+
+    async def _stop_ringback_player(self, call_id: str) -> None:
+        """RingbackPlayer를 중단하고 제거한다."""
+        player = self._ringback_players.pop(call_id, None)
+        if player:
+            try:
+                await player.stop()
+                logger.info("ringback_player_removed", call_id=call_id)
+            except Exception as e:
+                logger.warning("ringback_player_stop_error", call_id=call_id, error=str(e))
+
+
+
+def create_sip_endpoint(config: Config) -> SIPEndpoint:
+    """SIP Endpoint 팩토리 함수
+    
+    Args:
+        config: 설정 객체
+        
+    Returns:
+        SIPEndpoint: SIP Endpoint 인스턴스
+    """
+    return SIPEndpoint(config)

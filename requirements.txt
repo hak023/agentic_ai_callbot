@@ -1,0 +1,57 @@
+# Async & Web Framework
+aiohttp==3.9.1
+aiodns==3.1.0
+fastapi==0.109.0              # FastAPI framework for API Gateway
+uvicorn[standard]==0.27.0     # ASGI server for FastAPI
+python-socketio==5.11.0       # Socket.IO server for WebSocket
+python-multipart==0.0.6       # File upload support for FastAPI
+
+# Configuration & Validation
+pydantic==2.5.2
+pydantic-settings==2.1.0
+pydantic[email]==2.5.2  # Email validation support
+PyYAML==6.0.1
+
+# Audio Processing
+opuslib==3.0.1  # Opus codec decoder
+pydub>=0.25.1   # MP3 디코드 + μ-law 변환 (ffmpeg 백엔드 필요, 통화 연결음)
+
+# Monitoring & Logging
+prometheus-client==0.19.0
+structlog==24.1.0
+python-json-logger==2.0.7
+
+# Utilities
+python-dotenv==1.0.0
+PyJWT>=2.8.0                     # JWT encode/decode (auth_utils, WebSocket)
+python-jose[cryptography]==3.3.0  # JWT authentication (legacy)
+passlib[bcrypt]==1.7.4            # Password hashing
+redis==5.0.1                      # Redis client for caching/pub-sub
+asyncpg==0.29.0                   # PostgreSQL async driver
+
+# Testing
+pytest==7.4.3
+pytest-asyncio==0.21.1
+pytest-cov==4.1.0
+pytest-mock==3.12.0
+httpx==0.25.2  # For testing HTTP endpoints
+
+# Development Tools (optional, comment out for production)
+# black==23.11.0
+# isort==5.12.0
+# flake8==6.1.0
+# mypy==1.7.1
+# types-PyYAML==6.0.12.12
+# pip-audit==2.6.1
+
+# =============================================================================
+# Google Calendar 연동
+# =============================================================================
+google-auth>=2.0
+google-auth-oauthlib>=1.0
+google-api-python-client>=2.0
+
+# =============================================================================
+# AI Voice Assistant Extension
+# =============================================================================
+-r requirements-ai.txt

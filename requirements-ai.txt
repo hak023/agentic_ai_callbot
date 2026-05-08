@@ -1,0 +1,169 @@
+# =============================================================================
+# AI Voice Assistant Extension - Python Dependencies
+# =============================================================================
+# Python 3.11+
+# 
+# Installation:
+#   pip install -r requirements-ai.txt
+#
+# Note: This extends the base requirements.txt for AI functionality
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Google Cloud AI Services
+# -----------------------------------------------------------------------------
+google-cloud-speech==2.24.0          # STT (Speech-to-Text) with streaming
+google-cloud-texttospeech==2.16.3    # TTS (Text-to-Speech) with streaming
+google-generativeai==0.3.2           # Gemini LLM for conversation
+google-api-core==2.15.0              # Core library for Google APIs
+google-auth==2.26.2                  # Authentication for Google Cloud
+grpcio==1.60.1                       # gRPC for streaming APIs
+grpcio-status==1.60.1                # gRPC status codes
+protobuf==4.25.1                     # Protocol buffers
+
+# -----------------------------------------------------------------------------
+# Vector Database & Embeddings
+# -----------------------------------------------------------------------------
+# ChromaDB 0.6.x: 현재 DB 스키마(sysdb v10, metadb v6) 호환 버전.
+# 1.x 이상은 Rust 백엔드 도입으로 기존 BLOB seq_id 스키마와 호환 불가 (InternalError: mismatched types).
+# DB를 신규 생성하거나 공식 마이그레이션 경로가 확인되기 전까지 0.6.x 고정.
+chromadb>=0.6.0,<1.0.0              # Vector DB (0.6.x: 기존 DB 스키마 호환)
+# pinecone-client==3.0.0             # Vector DB for production (uncomment when ready)
+
+# Transformers & Embeddings (PyTorch 2.1 compatible versions)
+transformers==4.36.0                 # HuggingFace Transformers - PyTorch 2.1 compatible
+sentence-transformers==2.3.1         # Text embeddings (multilingual support) - PyTorch 2.1 compatible
+# 이전 버전: sentence-transformers==2.2.2 (PyTorch 2.1과 호환성 문제)
+# 이전 버전: transformers==4.35.x (PyTorch 2.1과 호환성 문제)
+
+# PyTorch with CUDA support (GPU acceleration)
+# Windows/Linux with CUDA 11.8:
+#   pip install torch==2.1.2 --index-url https://download.pytorch.org/whl/cu118
+# 
+# CPU only (기본):
+torch==2.1.2                         # PyTorch for sentence-transformers (CPU)
+# 
+# GPU 사용 시 위 torch 라인 주석 처리하고 아래 명령어 실행:
+#   pip uninstall torch -y
+#   pip install torch==2.1.2 --index-url https://download.pytorch.org/whl/cu118
+#
+numpy>=1.26.3,<2                     # Numerical computing (torch 2.1.x는 numpy<2 필요)
+scikit-learn==1.4.0                  # ML utilities for embeddings
+
+# -----------------------------------------------------------------------------
+# Pipecat AI Framework (Phase 1)
+# -----------------------------------------------------------------------------
+pipecat-ai[google,silero]>=0.0.85    # Voice AI pipeline framework
+                                      # Includes: Silero VAD, Google STT/TTS/Gemini
+
+# -----------------------------------------------------------------------------
+# LangGraph Agentic RAG (Phase 2)
+# -----------------------------------------------------------------------------
+langgraph>=0.1.0                     # Agent workflow orchestration
+langgraph-checkpoint-sqlite>=2.0.0   # AsyncSqliteSaver — aiosqlite + async 그래프(ainvoke) 필수
+aiosqlite>=0.20.0                    # AsyncSqliteSaver 의존성 (동기 SqliteSaver는 async 미지원)
+langchain-core>=0.2.0                # LangGraph core dependency
+
+# -----------------------------------------------------------------------------
+# Audio Processing
+# -----------------------------------------------------------------------------
+pydub==0.25.1                        # Audio manipulation
+ffmpeg-python==0.2.0                 # FFmpeg wrapper for audio conversion
+webrtcvad==2.0.10                    # Voice Activity Detection (legacy, kept for fallback)
+# pyaudio==0.2.14                    # Audio I/O (optional, may need system deps)
+# audioop and wave are built-in modules in Python 3.11+
+
+# -----------------------------------------------------------------------------
+# Resilience & Reliability
+# -----------------------------------------------------------------------------
+tenacity==8.2.3                      # Retry mechanism with exponential backoff
+pybreaker==1.0.1                     # Circuit breaker pattern
+backoff==2.2.1                       # Alternative backoff implementation
+
+# -----------------------------------------------------------------------------
+# Async & Networking (extends base requirements.txt)
+# -----------------------------------------------------------------------------
+# aiohttp==3.9.1                     # Async HTTP (already in base requirements.txt)
+# aiodns==3.1.0                      # Async DNS resolution (already in base)
+aiofiles==23.2.1                     # Async file operations
+
+# -----------------------------------------------------------------------------
+# Configuration & Validation (extends base requirements.txt)
+# -----------------------------------------------------------------------------
+# pydantic==2.5.2                    # Data validation (already in base)
+# pydantic-settings==2.1.0           # Settings management (already in base)
+# PyYAML==6.0.1                      # YAML configuration (already in base)
+# python-dotenv==1.0.0               # Environment variables (already in base)
+
+# -----------------------------------------------------------------------------
+# Monitoring & Logging (extends base requirements.txt)
+# -----------------------------------------------------------------------------
+# prometheus-client==0.19.0          # Metrics collection (already in base)
+# structlog==24.1.0                  # Structured logging (already in base)
+# python-json-logger==2.0.7          # JSON log formatting (already in base)
+
+# -----------------------------------------------------------------------------
+# Testing & Development
+# -----------------------------------------------------------------------------
+# pytest==7.4.3                      # Testing framework (already in base)
+# pytest-asyncio==0.21.1             # Async test support (already in base)
+# pytest-cov==4.1.0                  # Coverage reporting (already in base)
+# pytest-mock==3.12.0                # Mocking utilities (already in base)
+pytest-vcr==1.0.2                    # Record/replay HTTP interactions
+pytest-timeout==2.2.0                # Test timeout handling
+# httpx==0.25.2                      # Modern HTTP client (already in base)
+faker==22.0.0                        # Fake data generation
+freezegun==1.4.0                     # Time mocking for tests
+
+# -----------------------------------------------------------------------------
+# Code Quality & Linting (development only)
+# -----------------------------------------------------------------------------
+# Uncomment for development
+# black==23.12.1                     # Code formatting
+# isort==5.13.2                      # Import sorting
+# flake8==7.0.0                      # Linting
+# mypy==1.8.0                        # Type checking
+# types-PyYAML==6.0.12.12            # Type stubs for PyYAML
+# types-aiofiles==23.2.0.0           # Type stubs for aiofiles
+# bandit==1.7.6                      # Security linting
+# pylint==3.0.3                      # Advanced linting
+
+# -----------------------------------------------------------------------------
+# Utilities
+# -----------------------------------------------------------------------------
+click==8.1.7                         # CLI framework (for scripts)
+tqdm==4.66.1                         # Progress bars
+colorama==0.4.6                      # Colored terminal output (Windows support)
+tabulate==0.9.0                      # Pretty-print tabular data
+
+# -----------------------------------------------------------------------------
+# Optional: Alternative Vector DBs (uncomment as needed)
+# -----------------------------------------------------------------------------
+# qdrant-client==1.7.0               # Qdrant vector DB
+# weaviate-client==3.26.0            # Weaviate vector DB
+# milvus==2.3.5                      # Milvus vector DB
+
+# -----------------------------------------------------------------------------
+# Optional: Alternative Embeddings (uncomment as needed)
+# -----------------------------------------------------------------------------
+# openai==1.6.1                      # OpenAI embeddings (paid)
+# cohere==4.37                       # Cohere embeddings (paid)
+
+# -----------------------------------------------------------------------------
+# System Dependencies Notes
+# -----------------------------------------------------------------------------
+# 
+# Linux/Mac:
+#   sudo apt-get install ffmpeg portaudio19-dev  # Ubuntu/Debian
+#   brew install ffmpeg portaudio                 # macOS
+#
+# Windows:
+#   Download ffmpeg: https://ffmpeg.org/download.html
+#   Add to PATH
+#
+# PyAudio Windows:
+#   pip install pipwin
+#   pipwin install pyaudio
+#
+# =============================================================================
+

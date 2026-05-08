@@ -1,0 +1,129 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environment
+venv/
+ENV/
+env/
+.venv
+
+# PyCharm
+.idea/
+*.iml
+*.iws
+.idea_modules/
+
+# VSCode
+.vscode/
+*.code-workspace
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# pytest
+.pytest_cache/
+.coverage
+htmlcov/
+*.cover
+.hypothesis/
+*.log
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Environments
+.env
+.env.local
+.env.*.local
+
+# Google Cloud / API keys / 설정 (API 키 포함, GitHub에 올리지 않음)
+config/config.yaml
+config/*key*.json
+config/sip_pbx_stt_key*.json
+
+# OS
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Logs (커밋 제외)
+logs/
+*.log
+*.log.*
+/var/log/
+
+# CDR Files
+*.jsonl
+cdr-*.jsonl
+
+# AI Models (large files, download separately)
+models/
+*.pth
+*.onnx
+*.bin
+*.safetensors
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# IDE-specific
+.ropeproject
+.project
+.pydevproject
+.settings/
+
+# Docker
+.dockerignore
+
+# Kubernetes secrets
+k8s/base/secret.yaml
+k8s/overlays/*/secret.yaml
+
+# Test outputs
+test-reports/
+coverage.xml
+nosetests.xml
+junit.xml
+
+# Profiling
+*.prof
+*.lprof
+
+# Database (if any)
+*.db
+*.sqlite
+*.sqlite3
+
+# 로컬 런타임 데이터 (통화 녹음·벡터 DB 등 — GitHub에 올리지 않음)
+recordings/
+data/
+
+config/gcp-key.json

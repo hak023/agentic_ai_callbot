@@ -1,0 +1,22 @@
+# sip-pbx/config/config.yaml 참고용 예시 (이 파일명을 config.yaml 로 복사해 사용)
+#
+# Suno 음원 생성 시 PBX가 api.sunoapi.org 로 보내는 JSON에 callBackUrl 이 필수입니다.
+# 아래 중 하나(또는 환경변수 SUNO_CALLBACK_URL / PUBLIC_API_BASE_URL)를 서버에 설정하세요.
+# UI나 API 요청 본문으로 콜백 URL을 받지 않습니다.
+#
+# 로컬 ngrok 예시:
+#   1) 터미널에서: ngrok http 8000   (FastAPI 와 동일 포트)
+#   2) 아래 ringback.use_ngrok_tunnel: true
+#   3) (선택) ringback.ngrok_local_api_url — 기본 http://127.0.0.1:4040
+# PBX가 ngrok 로컬 API에서 공개 https URL 을 읽어 callBackUrl 을 조합합니다.
+# (선택) 환경변수 RINGBACK_USE_NGROK_TUNNEL / RINGBACK_NGROK_LOCAL_API_URL 로도 동일 설정 가능
+
+ringback:
+  suno_api_key: "" # 또는 환경변수 SUNO_API_KEY
+  # ngrok 자동 callBackUrl (로컬 에이전트 /api/tunnels). 운영은 public_api_base_url 권장
+  use_ngrok_tunnel: false
+  # ngrok_local_api_url: "http://127.0.0.1:4040"
+  # 옵션 A: Suno가 POST할 전체 URL
+  # suno_callback_url: "https://your-public-host.example/api/ringback/suno-callback"
+  # 옵션 B: 공개 API 베이스만 지정 시 PBX가 /api/ringback/suno-callback 을 붙임
+  # public_api_base_url: "https://xxxx.ngrok-free.dev"  # 또는 .ngrok-free.app (4040/status 의 Public URL 과 동일)
