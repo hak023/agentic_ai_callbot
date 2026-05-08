@@ -1,0 +1,111 @@
+# 🏗️ Design - 상세 설계 문서
+
+개발자를 위한 구현 수준의 상세 설계 문서 모음. **최종 아키텍처·스택**은 [../architecture/](../architecture/)의 `technical-architecture.md`·`production-deployment-architecture.md`를 우선한다(본 폴더는 설계·연구·히스토리가 섞일 수 있음).
+
+---
+
+## 📋 AI 구현 가이드
+
+### [ai-implementation-guide.md](ai-implementation-guide.md)
+AI 컴포넌트 구현 가이드 Part 1
+- **8개 핵심 컴포넌트** 상세 설계
+- Audio Buffer & Jitter
+- VAD Detector
+- STT/TTS/LLM Client
+- RAG Engine
+- Recording & Knowledge Extraction
+
+**내용**:
+- 컴포넌트 아키텍처
+- 클래스 설계 및 메서드 정의
+- 코드 예시 (Python)
+- 테스트 케이스
+- 에러 처리 전략
+
+### [ai-implementation-guide-part2.md](ai-implementation-guide-part2.md)
+AI 컴포넌트 구현 가이드 Part 2
+- **7개 추가 컴포넌트** 상세 설계
+- Vector DB (ChromaDB)
+- Text Embedder
+- Orchestrator (전체 통합)
+- 데이터 모델 (Conversation, Knowledge, Recording)
+
+**내용**:
+- 고급 컴포넌트 설계
+- 통합 시나리오
+- 성능 최적화 팁
+- 확장 가능성 고려사항
+
+---
+
+## 🆕 운영자 부재중 모드
+
+### [OPERATOR-AWAY-MODE-DESIGN.md](OPERATOR-AWAY-MODE-DESIGN.md)
+운영자 부재중 모드 상세 설계
+- **워크플로우**: 부재중 시 HITL 처리 흐름
+- **API 설계**: 운영자 상태 관리 엔드포인트
+- **DB 스키마**: `unresolved_hitl_requests` 테이블
+- **Frontend UI**: 상태 토글 및 이력 관리
+
+**내용**:
+- 상태 다이어그램 (Available/Away/Busy/Offline)
+- RESTful API 명세
+- WebSocket 이벤트 정의
+- PostgreSQL 테이블 설계
+- UI 컴포넌트 설계
+
+---
+
+## 🏢 멀티테넌트 RAG 및 대시보드
+
+### [multi-tenant-rag-and-dashboard.md](multi-tenant-rag-and-dashboard.md)
+착신번호 기반 멀티테넌트 RAG 및 대시보드 실제 구현 설계
+- **멀티테넌트 아키텍처**: 착신번호(1003/1004)별 데이터 격리
+- **VectorDB 단일 소스**: organization_info.json → VectorDB 이전
+- **프론트엔드 실제 구현**: Mock → API 연동 전환
+- **로그인 시스템**: 착신번호 선택 기반 (패스워드 불필요)
+
+**내용**:
+- 시드 데이터 (1003=이탈리안 비스트로, 1004=기상청)
+- 백엔드 API 변경 (owner 필터, 테넌트 API)
+- 프론트엔드 전면 개편 (로그인, 대시보드, 지식관리)
+- 대화 기반 지식 축적 흐름
+- 구현 Phase 계획
+
+---
+
+## 📁 파일 목록
+
+| 파일 | 라인 수 | 설명 |
+|------|---------|------|
+| `ai-implementation-guide.md` | ~1,500 | AI 구현 가이드 Part 1 (8개 컴포넌트) |
+| `ai-implementation-guide-part2.md` | ~1,200 | AI 구현 가이드 Part 2 (7개 컴포넌트) |
+| `OPERATOR-AWAY-MODE-DESIGN.md` | ~800 | 운영자 부재중 모드 설계 |
+| `multi-tenant-rag-and-dashboard.md` | ~500 | 멀티테넌트 RAG + 대시보드 실제 구현 |
+
+**총 라인 수**: ~4,000 lines
+
+---
+
+## 🎯 사용 대상
+
+- **Backend 개발자**: Python/FastAPI 구현 시 참고
+- **Frontend 개발자**: React/Next.js 컴포넌트 설계 참고
+- **시스템 아키텍트**: 전체 시스템 통합 이해
+- **QA 엔지니어**: 테스트 케이스 작성 참고
+
+---
+
+## 🔗 관련 문서
+
+- **구현 기술 아키텍처**: [../architecture/technical-architecture.md](../architecture/technical-architecture.md)
+- **백엔드 모듈 상세**: [../architecture/ai-voicebot-architecture.md](../architecture/ai-voicebot-architecture.md)
+- **상용 배포·연동(타깃)**: [../architecture/production-deployment-architecture.md](../architecture/production-deployment-architecture.md)
+- **Frontend**: [../architecture/frontend-architecture.md](../architecture/frontend-architecture.md)
+- **구현·분석 리포트**: [../reports/README.md](../reports/README.md) (월별, 예: `2026-01/IMPLEMENTATION_STATUS.md`)
+
+---
+
+**상위 문서 인덱스**: [../INDEX.md](../INDEX.md)  
+**최종 업데이트**: 2026-05-08
+
