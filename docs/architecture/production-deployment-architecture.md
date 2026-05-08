@@ -1,4 +1,4 @@
-# SmartPBX AI - Production Deployment Architecture
+# 지능망 AI Call Agent - Production Deployment Architecture
 ## 상용 적용 상세 아키텍처 (기존 교환기/통화매니저AS/WTIMS 활용)
 
 본 문서는 실제 상용 목표 용량을 기준으로, 이미 보유한 통신 노드(교환기, 통화매니저AS, WTIMS)를 활용하여 AI 확장 계층(**AI Call Agent 시스템**: STT/TTS/LLM/API/Runtime/DB — **전용 NAS/Blob 없음**, 비파일 데이터는 PostgreSQL·**Qdrant(VectorDB)**)과 **EMS**(관측, 별도 구역)를 설계한다.
@@ -12,6 +12,105 @@
 | DB 제약 | RDB는 **PostgreSQL HA(최소 Primary+Standby)** 기준, 필요 시 Read Replica로 읽기 분산 |
 
 **관련 문서**: 현재 **개발 리포** 구현 세부·런타임 스택은 [technical-architecture.md](./technical-architecture.md)를 본다. 월별 변경·완료 보고서 요약은 [reports/README.md](../reports/README.md).
+
+---
+
+## 빠른 참조 (먼저 읽기)
+
+아래는 **EMS를 제외한** 상용 목표(**약 2,500 동시 세션**, 20 CPS, 평균 통화 120초)를 기준으로 한 **아키텍처·서버·비용 요약**이다. 용어·경계·연동 규격·체크리스트·상세 비용 근거는 **뒤쪽 절**을 참조한다.
+
+**읽는 순서(권장):** (1) 본 빠른 참조 → (2) 설계 전제(1절)·전체 배포도(2절) → (3) 프로토콜 요약(3절) → (4) 시퀀스·역할 스펙(4~6절) → (5) DB·EMS·체크리스트·결론(7~10절) → (6) 비용 상세(11절) → (7) **부록 A** 연동 예제.
+
+### 빠른 참조 — 아키텍처(요약 다이어그램)
+
+**한 줄:** 기존 **교환기 → 통화매니저AS → WTIMS** 코어를 유지하고, WTIMS가 **RTP 미러로 STT**에 직접 연결되며, **통합 시그널만 AIR 연동 접점(GW)** → **AI Runtime** → STT/LLM/TTS로 처리한다. **유엔젤·바이토**는 **API/Realtime 단일 VIP**로만 AI에 진입한다.
+
+```mermaid
+flowchart LR
+    subgraph CORE["기존 코어"]
+        EX["교환기 N"] --> CM["통화매니저AS"] --> WT["WTIMS RTP"]
+    end
+    subgraph ACA["AI Call Agent · EMS 제외 요약"]
+        GW["AIR GW"]
+        AIR["AI Runtime"]
+        STT["STT"]
+        LLM["LLM"]
+        TTS["TTS"]
+        API["API/Realtime VIP+LB"]
+        PG[("PostgreSQL")]
+        QD[("Qdrant")]
+    end
+    UAPI["통화매니저 API 유엔젤"] --> API
+    BAPI["통화매니저 API 바이토"] --> API
+    WT -->|통합 시그널| GW --> AIR
+    WT -->|RTP mirror GW 비경유| STT
+    AIR --> STT
+    AIR --> LLM
+    AIR --> TTS --> WT
+    API <--> AIR
+    AIR --> PG
+    AIR --> QD
+```
+
+**전체 배포(EMS·관제·화살표 라벨 포함):** 2절.
+
+### 빠른 참조 — 통화·데이터 플로우(요약)
+
+1. SIP `INVITE` → 교환기 → 통화매니저AS → WTIMS(SIP/SDP, RTP 앵커).
+2. 사용자 음성 **RTP** → WTIMS → **STT(미러, GW 비경유)**.
+3. 통화매니저AS → WTIMS **호 세션 릴레이** → WT가 **통합 시그널**로 **AIR GW** → **`call_id` 스티키**로 AI Runtime.
+4. AIR ↔ STT 스트림, AIR → LLM, AIR → TTS → **WT로 재생(RTP)**.
+5. 유엔젤/바이토 → **API/Realtime 단일 VIP**(인바운드); AI → 코어 **아웃바운드** HTTPS 등(1.5·1.6절).
+
+**Mermaid 시퀀스:** 4절.
+
+### 빠른 참조 — EMS 제외 서버 구성 (2,500 세션)
+
+| 구분 | 서버 역할 | 권장 대수 |
+|------|-----------|-----------|
+| 기존 코어 | WTIMS RTP | 4 + 1 |
+| AI Call Agent | AIR 연동 접점 GW | 1 + 1 |
+| AI Call Agent | STT Server | 4 + 1 |
+| AI Call Agent | TTS Server | 3 + 1 |
+| AI Call Agent | LLM Server | 4 + 1 |
+| AI Call Agent | AI Runtime | 2 + 0 (All-Active) |
+| AI Call Agent | API/Realtime (VIP+LB) | 2 + 0 (All-Active) |
+| AI Call Agent | PostgreSQL HA | 2 + 0 |
+| AI Call Agent | Qdrant(VectorDB) | 2 + 0 |
+
+**신규 AI Call Agent 계층 합계:** **24노드** (EMS·교환기·통화매니저AS 본편 제외). **노드 수 산정 근거:** 6절.
+
+### 빠른 참조 — 노드 스펙 (AI Call Agent)
+
+| 서버 역할 | 권장 대수 | CPU | RAM | GPU | 스토리지 | NIC |
+|-----------|-----------|-----|-----|-----|----------|-----|
+| AIR 연동 접점 GW | 1 + 1 | 8 vCPU | 32 GB | - | NVMe 200 GB | 10 Gbps |
+| STT Server | 4 + 1 | 32 vCPU | 128 GB | L40S x1 | NVMe 1 TB | 10 Gbps |
+| TTS Server | 3 + 1 | 24 vCPU | 96 GB | L40S x1 | NVMe 1 TB | 10 Gbps |
+| LLM Server | 4 + 1 | 32 vCPU | 256 GB | L40S x2 | NVMe 2 TB | 25 Gbps |
+| AI Runtime | 2 + 0 | 16 vCPU | 64 GB | - | NVMe 500 GB | 10 Gbps |
+| API/Realtime | 2 + 0 | 16 vCPU | 32 GB | - | NVMe 500 GB | 10 Gbps |
+| PostgreSQL HA | 2 + 0 / 2 + 1 | 24 vCPU | 128 GB | - | NVMe 2 TB | 10 Gbps |
+| Qdrant | 2 + 0 / 3 + 0 | 16 vCPU | 64 GB | - | NVMe 1 TB | 10 Gbps |
+
+**역할별 모델·처리량 가정:** 5절. **WTIMS·EMS·기존 코어 행 포함 전체 표:** 6.1절.
+
+### 빠른 참조 — 용량·수용량 (2,500 세션)
+
+- **STT:** 4 Active × 625 세션/노드(벤치) = **2,500**.
+- **TTS:** 3 Active × 1,000 = **3,000** (여유).
+- **LLM:** 480 QPS·288 동시 생성 가정 → 4 Active × 80 = **320**.
+- **AI Runtime / API:** 각 2 Active × 2,500 = 정상 **5,000**; **1노드 장애 시 2,500** 유지.
+- **WTIMS:** 4 Active × 800 = **3,200** RTP 수용(여유).
+
+**상세 체크리스트:** 6.2절.
+
+### 빠른 참조 — 비용 요약 (HW + SW)
+
+| 구분 | 금액(요약) | 상세 |
+|------|------------|------|
+| **하드웨어 CAPEX** | AI Call Agent **24노드** 합계 약 **657,760,000원** (ROM); 현실 범위 **약 5.3억 ~ 7.9억원**(±20%) | 11.1·11.2절, 출처 11.4절 |
+| **SW·연동 개발** | WTIMS 경로 **약 0.7억원**(과거 산출 이력); CM↔WT·유엔젤/바이토↔API·EMS 연동 등 **추후 산출** | 11.3절 |
 
 ---
 
@@ -123,6 +222,8 @@
 
 ## 2) 전체 배포 구조 (Mermaid)
 
+**EMS 제외 요약 도식:** 문서 앞쪽 **빠른 참조 — 아키텍처(요약 다이어그램)**. 본 절은 **EMS·관제·화살표 라벨**까지 포함한 전개도다.
+
 ```mermaid
 flowchart LR
     subgraph EXT["외부 통신 영역"]
@@ -229,7 +330,7 @@ flowchart LR
 - **AI Call Agent 시스템**은 STT·TTS·LLM·AI Runtime·API/Realtime·데이터 계층(PostgreSQL·Qdrant) 등 **신규 서버 모음**을 가리킨다. **통화 녹음 파일은 기존 WTIMS**에서 수행·보관하며, AI 계층은 **전용 공유 파일 스토리지 없이** 노드 **로컬 임시**로 부산물·캐시를 처리한다(§7.3). **EMS**(관측)는 같은 업무 도메인과 연계되지만 **별도 구역**으로 두고, OTel Collector·Metrics TSDB·Log·Trace·Alert·Grafana를 **각각 독립 프로세스**로 배포한다. AI Runtime이 통화 이벤트 기반으로 STT/LLM/TTS를 호출하고, 결과 음성을 다시 WTIMS로 전달한다.
 - 호의 **통합 시그널**(세션 스냅샷·`call_id`·레그 바인딩 메타)은 **통화매니저AS → WTIMS → AIR 연동 접점 GW → AI Runtime**으로 릴레이된다. 코어(WT)는 GW **한 주소**만 사용한다(§1.4). **RTP 미디어**(Mirror→STT, TTS→WT 등)는 **GW를 거치지 않고** WTIMS가 STT·AIR·WT 간 직접 경로를 유지한다(§1.4 표).
 - PostgreSQL은 거래성 데이터(세션, 정책, 예약, 이력), **Qdrant**는 의미 검색을 담당한다. **녹음 미디어는 WTIMS**가 담당하고, 그 외 파일성 부산물은 **각 서버 로컬 디스크**를 사용한다(§7.3).
-- 위 Mermaid 화살표 라벨은 **연동 규격**(프로토콜·형식·상관 키)을 요약한 것이며, 세부 필드는 §3 연동 규격표·예제와 일치시킨다.
+- 위 Mermaid 화살표 라벨은 **연동 규격**(프로토콜·형식·상관 키)을 요약한 것이며, 세부 필드는 **3.2절 표·부록 A**와 일치시킨다.
 - 위 Mermaid 박스는 **첫 줄=이름, 둘째 줄=§2.0 구성요소 유형**을 병기했다. **EMS** 서브그래프는 AI Call Agent 시스템과 **분리**하여 표시한다.
 - 도표상 동일한 박스로 보일 수 있으나, 실제로는 **프로세스형 서버·DBMS·단말/클라이언트**로 구분한다(§2.0).
 - **WTIMS → AI Runtime**은 기존 코어와 신규 시스템의 **경계**이므로, AIR 노드 다수에 WT가 직접 붙지 않고 **AIR 연동 접점**(단일 VIP/FQDN에 대응하는 LB·게이트웨이)을 두어 **연동 노드·주소를 단일화**한다. 내부 풀(STT·LLM·TTS 등) 간 부하는 동일 구역 내 일반 로드밸런싱으로 처리한다(§2.2).
@@ -346,7 +447,7 @@ flowchart LR
 
 **비권장(경계 구간):** WT 프로세스가 AIR 목록을 직접 들고 호마다 노드를 고르는 방식은 **연동 지점이 WT 전 노드에 분산**되어 방화벽·버저닝·장애 시 공조가 어렵다. 불가피할 경우에만 검토하고, 그래도 **논리 주소는 단일 접점으로 노출**하는 편이 운영에 유리하다.
 
-**AIR 장애 시:** 접점에서 헬스 체크 후 다른 AIR로 보내면 세션 연속성이 깨질 수 있으므로, **동일 호 재바인딩 정책**(짧은 재시도·세션 복구 스키마)을 계약에 포함하거나, 상태를 PostgreSQL 등에 두는 **완화 스티키**와 트레이드오프를 명시한다(§3).
+**AIR 장애 시:** 접점에서 헬스 체크 후 다른 AIR로 보내면 세션 연속성이 깨질 수 있으므로, **동일 호 재바인딩 정책**(짧은 재시도·세션 복구 스키마)을 계약에 포함하거나, 상태를 PostgreSQL 등에 두는 **완화 스티키**와 트레이드오프를 명시한다(3.4절·부록 A).
 
 STT·LLM·TTS 풀은 AIR가 **동일 호에 대해** 저지연으로 호출할 수 있도록 같은 존 또는 근접 네트워크에 두고, AIR 간 부하는 **세션 수 기준**으로 산정한다(§6).
 
@@ -408,7 +509,7 @@ flowchart TD
 - **오류**: HTTP 상태·gRPC `status`, 애플리케이션 오류 코드·재시도 가능 여부
 - **시간 제약**: STT/미디어는 저지연, LLM은 큐·타임아웃 별도, 이벤트는 소비 지연 허용 범위 명시
 
-아래 **예제는 설계·프로토타입용 의사 샘플**이며, 필드명·타입은 실제 구현 시 proto/OpenAPI로 확정한다.
+**샘플 페이로드**는 설계·프로토타입용이며 **부록 A**에 수록했다. 필드명·타입은 실제 구현 시 proto/OpenAPI로 확정한다.
 
 ### 3.2 연동 규격 요약표
 
@@ -418,7 +519,7 @@ flowchart TD
 |------|----------------|------|-----------|
 | 교환기 ↔ 통화매니저AS | SIP 2.0, SDP, UDP/TCP/TLS | 양방향 | Trunk, INVITE/ACK/BYE, 코덱·미디어 협상 |
 | 통화매니저AS ↔ WTIMS | **SIP 2.0 + SDP + RTP/RTCP** | 양방향 | 미디어 앵커·세션 제어; 호 상관·테넌트 등 AI 연계 메타는 **SIP 헤더·SDP 속성·협의된 SDP 필드** 등으로 전달. **CM↔WT 구간은 JSON 페이로드 규격으로 두지 않는다.** WT는 여기서 확보한 세션 정보와 미디어 메타를 합쳐 **AIR 연동 접점**으로 내보낸다 |
-| WTIMS → AIR 연동 접점 | gRPC 또는 Kafka 등 §3 예제와 동일 규약 | WT→GW | **코어↔신규 구역 단일 주소**(VIP/FQDN); WT는 AIR 노드 목록 미보유 |
+| WTIMS → AIR 연동 접점 | gRPC 또는 Kafka 등 **부록 A**와 동일 규약 | WT→GW | **코어↔신규 구역 단일 주소**(VIP/FQDN); WT는 AIR 노드 목록 미보유 |
 | AIR 연동 접점 → AI Runtime | 동상 내부 전달 | GW→AIR | **`call_id` 일관 해시·세션 스티키**로 AIR N대 로드쉐어 §2.2 |
 | WTIMS → STT | RTP 또는 SRTP 미러 | WT→STT | PCM 16 kHz mono 등 사전 합의 코덱 |
 | AI Runtime ↔ STT | gRPC bidi, 오디오 프레임 + 메타 | 양방향 | 세션 메타 첫 프레임·부분/최종 텍스트 스트림 |
@@ -440,168 +541,7 @@ flowchart TD
 
 ### 3.3 연동 규격 예제
 
-#### A. 통화매니저AS ↔ WTIMS (SIP/SDP 예시)
-
-CM과 WT 사이 호·미디어 제어는 **JSON이 아니라 SIP와 SDP**(데이터는 RTP/RTCP)로 한다. 아래는 의사 샘플이며, `Call-ID`·SDP의 `c=`/`m=`/`a=` 등 실제 필드와 조직 내 확장 헤더 규약으로 확정한다.
-
-```http
-INVITE sip:media@wtims.example.com SIP/2.0
-Via: SIP/2.0/UDP cm.example.com;branch=z9hG4bK776asdhds
-Max-Forwards: 70
-From: <sip:+821012345678@cm.example.com>;tag=1928301774
-To: <sip:media@wtims.example.com>
-Call-ID: cm-7f3a9b2c-001@cm.example.com
-CSeq: 1 INVITE
-Contact: <sip:cm.example.com:5060>
-Content-Type: application/sdp
-X-Tenant-Id: tenant-01
-
-v=0
-o=CM 123456789 123456789 IN IP4 203.0.113.10
-s=SmartPBX
-c=IN IP4 203.0.113.20
-t=0 0
-m=audio 49170 RTP/AVP 0 8
-a=rtpmap:0 PCMU/8000
-```
-
-DNIS·서비스 프로파일 등은 **별도 JSON 파일이 아니라** SIP `Request-URI`/`To`, `P-` 또는 사내 확장 헤더·SDP `a=` 라인 등으로 옮길지 정책으로 확정한다.
-
-#### B. WTIMS → AIR 연동 접점 → AI Runtime 통합 시그널 (세션 릴레이 + 미디어 레그)
-
-WTIMS가 **SIP/SDP로 CM과 맺은 세션**에서 해석한 필드와 자체 미디어 메타를 **한 페이로드**로 **AIR 연동 접점**에 보내고, 접점이 **`call_id` 로드쉐어**로 적절한 AIR 인스턴스에 전달한다(gRPC·Kafka 등 **WT→GW 구간 JSON/바이너리 규약**). 미디어 미준비 구간은 `media` 생략 또는 `state`로 표현할 수 있다.
-
-```json
-{
-  "schema_version": "1.0",
-  "event_type": "call.context_and_media",
-  "occurred_at": "2026-05-07T12:34:56.801Z",
-  "call_id": "cm-7f3a9b2c-001",
-  "session_relay": {
-    "direction": "inbound",
-    "service_profile": "ai_voice_agent",
-    "dnis": "023331234",
-    "tenant_id": "tenant-01"
-  },
-  "leg_id": "wt-leg-a1",
-  "mirror": {
-    "stt_stream_key": "stt-stream-9x4k",
-    "codec": "pcm_s16le",
-    "sample_rate_hz": 16000,
-    "channels": 1
-  },
-  "tts": {
-    "inject_slot_id": "tts-slot-3"
-  }
-}
-```
-
-#### C. AI Runtime ↔ STT gRPC 스트림 첫 메타데이터 (개념 예시, JSON 등가)
-
-스트림 오픈 직후 한 번 보내는 헤더 프레임 개념이다.
-
-```json
-{
-  "call_id": "cm-7f3a9b2c-001",
-  "stt_stream_key": "stt-stream-9x4k",
-  "language": "ko-KR",
-  "partial_results": true
-}
-```
-
-#### D. AI Runtime → LLM OpenAI 호환 Chat Completion (요청 예시)
-
-```http
-POST /v1/chat/completions HTTP/1.1
-Host: llm-internal.example.com
-Authorization: Bearer ${SERVICE_TOKEN}
-Content-Type: application/json
-```
-
-```json
-{
-  "model": "qwen2.5-14b-instruct",
-  "stream": true,
-  "messages": [
-    { "role": "system", "content": "You are a call-center assistant. Reply in Korean." },
-    { "role": "user", "content": "예약 가능한 시간 알려줘." }
-  ]
-}
-```
-
-#### E. AI Runtime → TTS 스트리밍 합성 시작 (바디 예시)
-
-```json
-{
-  "voice_id": "ko-KR-female-01",
-  "text": "내일 오전 10시로 예약했습니다.",
-  "audio_format": "pcm_s16le",
-  "sample_rate_hz": 16000,
-  "call_id": "cm-7f3a9b2c-001"
-}
-```
-
-#### F. AI Runtime → WTIMS 재생 명령 (제어 API 예시)
-
-실제 전송은 사내 RPC·REST 중 선택; 페이로드 개념만 정리한다.
-
-```json
-{
-  "call_id": "cm-7f3a9b2c-001",
-  "inject_slot_id": "tts-slot-3",
-  "action": "enqueue_pcm",
-  "seq_base": 1000,
-  "total_frames_hint": 2400
-}
-```
-
-#### G. API/Realtime → AI Runtime 내부 조회 (REST 예시)
-
-```http
-GET /internal/v1/sessions/cm-7f3a9b2c-001/summary HTTP/1.1
-Host: api-realtime.internal
-X-Service-Auth: Bearer ${API_TOKEN}
-```
-
-#### H. 운영 콘솔 WebSocket 이벤트 (서버 → 브라우저)
-
-```json
-{
-  "type": "call.event",
-  "call_id": "cm-7f3a9b2c-001",
-  "payload": {
-    "state": "active",
-    "hitl_pending": false
-  }
-}
-```
-
-#### I. Qdrant 문서 업서트 (HTTP JSON 예시)
-
-```json
-{
-  "collection": "kb_prod",
-  "id": "doc-uuid-1234",
-  "embedding": [0.01, -0.02, 0.003],
-  "metadata": { "source": "faq", "tenant_id": "tenant-01" }
-}
-```
-
-임베딩 벡터는 차원에 맞는 실수 배열로 전송한다.
-
-#### J. 로컬 임시 파일 — API가 반환하는 업로드·처리 대상 (개념)
-
-**통화 녹음 원본은 WTIMS**가 담당한다. AI 계층에서는 노드 **로컬 디스크**에 임시·부산물을 두고, 필요 시 사내 REST가 스트림을 받아 **해당 인스턴스 로컬 경로에 쓰기**한다. 초기에는 **전용 공유 스토리지(NAS/Blob) 없음**(§7.3).
-
-```json
-{
-  "storage": "local_ephemeral",
-  "host_hint": "api-realtime-03",
-  "relative_path": "/var/lib/ai-call-agent/uploads/tenant-01/2026/05/import-batch.tgz",
-  "uri_internal": "https://api.internal/v1/files/upload?tenant_id=tenant-01",
-  "retention_policy": "purge_after_days_or_on_success"
-}
-```
+SIP/SDP·JSON·HTTP 등 **프로토타입용 샘플**은 **문서 맨 뒤 [부록 A) 연동 규격 예제]** 에 모았다. 계약 범위·전송 원칙은 3.1절, 연결 요약은 3.2절 표를 본다.
 
 ### 3.4 연동 규격 제안 (체크리스트)
 
@@ -624,6 +564,8 @@ X-Service-Auth: Bearer ${API_TOKEN}
 ---
 
 ## 4) 통화 처리 시퀀스 (Mermaid Sequence)
+
+**단계별 요약(텍스트):** 문서 앞쪽 **빠른 참조 — 통화·데이터 플로우**. 본 절은 참여자 간 메시지 순서를 **시퀀스 다이어그램**으로 보여 준다.
 
 STT·LLM·TTS·AI Runtime 참여자는 **AI Call Agent 시스템** 소속 컴포넌트로 본다. 교환기·통화매니저AS·WTIMS는 기존 코어다. 아래 시퀀스에서 **AIR 연동 접점**(LB/GW)은 WT와 AIR 클러스터 사이 **단일 논리 진입**으로 표기했으며, 실제 배포는 §2·§2.2와 같다.
 
@@ -670,6 +612,8 @@ sequenceDiagram
 ---
 
 ## 5) 서버 역할별 권장 모델 및 스펙
+
+**AI Call Agent 노드 스펙 표(요약):** 문서 앞쪽 **빠른 참조 — 노드 스펙**. 본 절은 **모델·처리량 가정·운영 한도**까지 포함한 역할별 설명이다.
 
 아래 역할군은 **AI Call Agent 시스템**을 구성하는 신규 계획 노드다. 기존 코어(교환기·통화매니저AS·WTIMS)는 제외한다.  
 **통화매니저 API(유엔젤·바이토)** 및 **유저 PC Client**는 §1.5 기존 자산이며 본 절 노드 스펙 표에는 포함하지 않는다.
@@ -736,6 +680,8 @@ sequenceDiagram
 ---
 
 ## 6) 2,500 동시세션 기준 서버 산정표
+
+**EMS 제외 구성·스펙·용량 요약:** 문서 앞쪽 **빠른 참조** 절. 아래 표는 **EMS 포함** 전체 산정이며, 옵션은 6.3절.
 
 | 구분 | 계층 | 동시 부하 산정 | 노드당 처리량 가정 | 필요 Active 노드 | 권장 구성(여유 포함) |
 |------|------|----------------|--------------------|------------------|----------------------|
@@ -1007,35 +953,44 @@ flowchart LR
 
 ## 11) AI Call Agent 비용 산출
 
-본 절은 (1) **AI Call Agent 시스템**의 **하드웨어 CAPEX**(§11.1·§11.2)와 (2) **AI Call Agent를 제외한** 기존 노드·외부 연계 측 **소프트웨어 개발 비용**(§11.3)을 구분한다. 개발 비용은 산출된 항목만 금액을 표시하고, 미산출 항목은 **항목·범위만 기재**하여 추후 공수·금액 산출 시 채운다.
+**한눈에 요약(EMS 제외 HW·SW):** 문서 앞쪽 **빠른 참조 — 비용 요약**을 본다. 아래는 단가 가정·역할별 합산·연동 개발 항목·출처의 **상세**다.
 
-### 11.1 단가 가정(USD) — 서버 하드웨어
+본 절은 (1) **AI Call Agent 시스템**의 **하드웨어 CAPEX**(11.1절·11.2절)와 (2) **AI Call Agent를 제외한** 기존 노드·외부 연계 측 **소프트웨어 개발 비용**(11.3절)을 구분한다. 개발 비용은 산출된 항목만 금액을 표시하고, 미산출 항목은 **항목·범위만 기재**하여 추후 공수·금액 산출 시 채운다.
 
-아래는 **EMS 제외**, **AI Call Agent 시스템 서버 노드**만 대상으로, 2026-05 시점 웹 공개가를 기준으로 한 **러프오더(ROM) CAPEX**용 단가다.
+### 11.1 단가 가정(원화) — 서버 하드웨어 (다나와 공개가 기준)
 
-- GPU: NVIDIA L40S 1장 **$9,000** (시장가 기준)
-- CPU: AMD EPYC 9354 1개 **$2,700 ~ $3,400** (중앙값 $3,000 적용)
-- 메모리: DDR5 ECC RDIMM 128GB 모듈 **$1,400** 수준
-- 엔터프라이즈 NVMe(U.2) 1.6~1.9TB **$900 ~ $1,300** 구간
-- 2U 서버 베어본(섀시+보드+이중 PSU) **$1,850 ~ $3,150** (중앙값 $2,500 적용)
-- 환율: **1 USD = 1,471 KRW**(2026년 5월 초 레퍼런스)
+아래는 **EMS 제외**, **AI Call Agent 시스템 서버 노드**만 대상으로, **2026-05 조사 시점** [다나와](https://www.danawa.com/) 상품 최저가(배송비 포함·일부 제외)를 기준으로 한 **러프오더(ROM) CAPEX**용 단가다. 수입·직거래·벌크 상품은 판매점·세금계산서 조건에 따라 달라진다.
+
+| 구분 | 국내 참고 단가(원) | 비고 |
+|------|---------------------|------|
+| GPU | **12,338,790**~(배송별도 상술) | NVIDIA L40S D6 48GB, 다나와 최저가 기준 |
+| CPU (32코어급) | **약 4,180,900** | AMD EPYC 9354 벌크(배송 약 3,000원 별도 상술) |
+| CPU (16코어급) | **약 3,460,100** | AMD EPYC 9124 벌크(배송 약 3,000원 별도 상술) |
+| DDR5 ECC RDIMM | **64GB 약 3,725,600 / 128GB 약 8,719,010** | 삼성전자 DDR5-5600 ECC/REG · 용량별 최저가 |
+| 엔터프라이즈 NVMe(U.2) | **약 811,000**(1.6TB, 배송 포함 상술) | 인텔 DC P4610 1.6TB |
+| 운영/부트용 NVMe(M.2) | **약 207,500**(500GB급) | 삼성 970 EVO Plus 500GB 등 |
+| 서버 플랫폼 | **별도 ROM 가산** | 2U GPU 1슬롯 **약 580만원**, GPU 2슬롯 **약 920만원**, CPU 전용 **약 380만원** — 섀시·SP5 보드·듀얼 PSU·랙레일·현장 조립·기본 보증 가산(다나와 단일 SKU 부족 시 SI 구간) |
+
+**환율**: 국내 조달 위주이므로 USD 표기는 생략한다. 해외 카드·분할 결제 시점 환율은 발주일 기준으로 별도 산정한다.
 
 ### 11.2 역할별 서버 비용(EMS 제외)
 
-| 구분 | 수량 | 노드당 단가(USD, 가정) | 합계(USD) | 합계(KRW, 1,471) |
-|------|------|--------------------------|-----------|------------------|
-| AIR 연동 접점 GW (CPU only) | 2 | $4,000 | $8,000 | 약 11,768,000원 |
-| STT Server (L40S x1) | 5 | $16,600 | $83,000 | 약 122,093,000원 |
-| TTS Server (L40S x1) | 4 | $16,000 | $64,000 | 약 94,144,000원 |
-| LLM Server (L40S x2) | 5 | $28,200 | $141,000 | 약 207,411,000원 |
-| AI Runtime (CPU only) | 2 | $6,800 | $13,600 | 약 20,005,600원 |
-| API/Realtime (CPU only) | 2 | $6,800 | $13,600 | 약 20,005,600원 |
-| PostgreSQL HA | 2 | $8,800 | $17,600 | 약 25,889,600원 |
-| Qdrant(VectorDB) | 2 | $6,100 | $12,200 | 약 17,946,200원 |
-| **총계(EMS 제외, AI Call Agent만)** | **24노드** | - | **$353,000** | **약 519,263,000원** |
+**산정 방식:** 11.1절 단가로 주요 부품(GPU·CPU·메모리·디스크)을 합산하고, **GPU 장착 수·스토리지 용량**에 따라 11.1절 표의 **서버 플랫폼 ROM**을 더해 노드당 원가를 정했다. 메모리는 동일 용량을 **64GB 모듈 조합**(다나와 가격 효율)으로 맞춘 경우가 있다.
 
-> 범위 권고: 부품 단가 변동(리셀러/재고/환율/유지보수 포함 여부) 때문에 실제 발주가는 보통 **±20%** 편차가 발생한다.  
-> 따라서 본 총액의 현실적 구매 범위는 **약 $282K ~ $424K (약 4.15억 ~ 6.24억원)**로 본다.
+| 구분 | 수량 | 노드당 단가(원, ROM) | 합계(원) |
+|------|------|----------------------|----------|
+| AIR 연동 접점 GW (CPU only) | 2 | 약 9,258,000 | 약 18,516,000 |
+| STT Server (L40S x1) | 5 | 약 30,582,000 | 약 152,910,000 |
+| TTS Server (L40S x1) | 4 | 약 28,647,000 | 약 114,588,000 |
+| LLM Server (L40S x2) | 5 | 약 54,584,000 | 약 272,920,000 |
+| AI Runtime (CPU only) | 2 | 약 11,048,000 | 약 22,096,000 |
+| API/Realtime (CPU only) | 2 | 약 9,258,000 | 약 18,516,000 |
+| PostgreSQL HA | 2 | 약 17,455,000 | 약 34,910,000 |
+| Qdrant(VectorDB) | 2 | 약 11,652,000 | 약 23,304,000 |
+| **총계(EMS 제외, AI Call Agent만)** | **24노드** | - | **약 657,760,000** |
+
+> 범위 권고: 부품·플랫폼 ROM·리셀러 할인·유지보수 포함 여부에 따라 실제 발주가는 보통 **±20%** 편차가 발생한다.  
+> 따라서 본 총액의 현실적 구매 범위는 **약 5.3억 ~ 7.9억원**으로 본다.
 
 ### 11.3 기존 노드·외부 연동 소프트웨어 개발(AI Call Agent 제외)
 
@@ -1066,14 +1021,190 @@ flowchart LR
 **EMS**
 
 - **필요 기능(간략)**: 기존 코어·AI Call Agent·API 컴포넌트에서 **OTLP(또는 동등)** 로 메트릭·로그·트레이스 인입, 수집 파이프라인·TSDB·로그 저장·트레이스 저장·알람·Grafana 대시보드·대표 VIP 접점과의 정합, (선택) 관제 PC·SSO·RBAC 연계.
-- **개발 금액**: **추후 산출**. EMS를 도입하지 않거나 전사 관제로 대체할 경우 §11.3 표의 EMS 행 및 본 bullet 범위를 재정의한다.
+- **개발 금액**: **추후 산출**. EMS를 도입하지 않거나 전사 관제로 대체할 경우 11.3절 표의 EMS 행 및 본 bullet 범위를 재정의한다.
 
-### 11.4 단가 출처(웹 리서치) — §11.1·§11.2 하드웨어
+### 11.4 단가 출처(웹 리서치) — 11.1절·11.2절 하드웨어
 
-- NVIDIA L40S 가격 참고: [GPUCost L40S](https://gpucost.org/gpu/l40s), [Hyperscalers L40S](https://www.hyperscalers.com/NVIDIA-L40S-GP-GPU-ADA-Lovelace-architecture-AI-Omniverse-Enterprise-Rendering-3D-Data-Science-Workstations), [Newegg L40S 검색](https://www.newegg.com/p/pl?d=l40s)
-- AMD EPYC 9354 가격 참고: [AMD 제품 페이지](https://www.amd.com/en/products/processors/server/epyc/4th-generation-9004-and-8004-series/amd-epyc-9354.html), [Newegg EPYC 9354](https://www.newegg.com/amd-epyc-9354-socket-sp5/p/1WK-0184-00068), [CDW EPYC 9354](https://www.cdw.com/product/amd-epyc-9354-3.25-ghz-processor-oem/8275725)
-- 메모리 가격 참고: [CDW 128GB DDR5 ECC RDIMM](https://www.cdw.com/product/128gb-ddr5-5600-2rx4-ecc-rdimm/8193650)
-- NVMe 가격 참고: [CDW Solidigm 1.6TB U.2](https://www.cdw.com/product/solidigm-ssd-1.6-tb-u.2-pcie-4.0-x4-nvme/8560167), [CDW Cisco 1.9TB U.2](https://www.cdw.com/product/cisco-ssd-high-performance-medium-endurance-1.9-tb-u.2-pcie-nvme/8191598)
-- 서버 베어본 가격 참고: [MITXPC Supermicro 6029P-TR](https://mitxpc.com/products/6029p-tr), [eBizPC Supermicro 6029P-TR](https://www.ebizpc.com/Supermicro-SYS-6029P-TR-SuperServer-p/sys-6029p-tr.htm), [RackmountPro 6029P-WTRT](https://www.rackmountpro.com/product/2549/6029P-WTRT.html)
-- 환율 참고: [Exchange-Rates.org USD/KRW 2026](https://www.exchange-rates.org/exchange-rate-history/usd-krw-2026), [XE USD/KRW](https://www.xe.com/en/currencyconverter/convert/?Amount=1&From=USD&To=KRW)
+**국내 가격비교(다나와)** — 2026-05 조사 시점 상품 페이지·검색 결과의 **최저가**를 인용했다. 링크는 가격 갱신으로 변동될 수 있다.
+
+| 부품·범주 | 다나와 참조 URL |
+|-----------|-----------------|
+| NVIDIA L40S D6 48GB | [상품: pcode 49266752](https://prod.danawa.com/info/?pcode=49266752) · 통합검색 [`nvidia l40s`](https://search.danawa.com/dsearch.php?query=nvidia+l40s) |
+| AMD EPYC 9354 / 9354P (벌크) | 통합검색 [`AMD EPYC 9354`](https://search.danawa.com/dsearch.php?query=AMD+EPYC+9354) — 노출 벌크 최저가 구간(직수입 1년 A/S 등) |
+| AMD EPYC 9124 (벌크) | 통합검색 [`AMD EPYC 9124`](https://search.danawa.com/dsearch.php?query=AMD+EPYC+9124) |
+| DDR5 ECC RDIMM (삼성 128GB·연관 64/32GB) | [128GB: pcode 76509239](https://prod.danawa.com/info/?pcode=76509239) |
+| 인텔 DC P4610 1.6TB U.2 | [pcode 13686647](https://prod.danawa.com/info/?pcode=13686647) |
+| 삼성 970 EVO Plus 500GB (부트/OS 급) | 통합검색 [`삼성 970 EVO Plus 500GB`](https://search.danawa.com/dsearch.php?query=%EC%82%BC%EC%84%B1+970+EVO+Plus+500GB) · 대표 [pcode 7136755](https://prod.danawa.com/info/?pcode=7136755) |
+| 동급 완제·조립 GPU 서버(교차검증) | 통합검색 [`AMD EPYC 9354`](https://search.danawa.com/dsearch.php?query=AMD+EPYC+9354) · [`nvidia l40s`](https://search.danawa.com/dsearch.php?query=nvidia+l40s) 내 **EPYC + L40S** 조합 2U 서버 견적 상품 |
+
+**플랫폼 ROM:** 다나와에서 동일 사양 **단일 SKU**(2U·듀얼 PSU·SP5·GPU 슬롯 수 고정)가 항상 노출되지 않아, 위 부품 합계 대비 **국내 SI·서버 조립 유통 구간**을 가산했다. 실제 CAPEX는 **제조사·리셀러 견적서**를 최종 근거로 한다.
+
+---
+
+## 부록 A) 연동 규격 예제 (프로토타입용)
+
+3.1절에서 밝힌 대로, 아래는 **설계·프로토타입용 의사 샘플**이며 필드명·타입은 실제 구현 시 proto/OpenAPI로 확정한다.
+
+#### A. 통화매니저AS ↔ WTIMS (SIP/SDP 예시)
+
+CM과 WT 사이 호·미디어 제어는 **JSON이 아니라 SIP와 SDP**(데이터는 RTP/RTCP)로 한다. 아래는 의사 샘플이며, `Call-ID`·SDP의 `c=`/`m=`/`a=` 등 실제 필드와 조직 내 확장 헤더 규약으로 확정한다.
+
+```http
+INVITE sip:media@wtims.example.com SIP/2.0
+Via: SIP/2.0/UDP cm.example.com;branch=z9hG4bK776asdhds
+Max-Forwards: 70
+From: <sip:+821012345678@cm.example.com>;tag=1928301774
+To: <sip:media@wtims.example.com>
+Call-ID: cm-7f3a9b2c-001@cm.example.com
+CSeq: 1 INVITE
+Contact: <sip:cm.example.com:5060>
+Content-Type: application/sdp
+X-Tenant-Id: tenant-01
+
+v=0
+o=CM 123456789 123456789 IN IP4 203.0.113.10
+s=SmartPBX
+c=IN IP4 203.0.113.20
+t=0 0
+m=audio 49170 RTP/AVP 0 8
+a=rtpmap:0 PCMU/8000
+```
+
+DNIS·서비스 프로파일 등은 **별도 JSON 파일이 아니라** SIP `Request-URI`/`To`, `P-` 또는 사내 확장 헤더·SDP `a=` 라인 등으로 옮길지 정책으로 확정한다.
+
+#### B. WTIMS → AIR 연동 접점 → AI Runtime 통합 시그널 (세션 릴레이 + 미디어 레그)
+
+WTIMS가 **SIP/SDP로 CM과 맺은 세션**에서 해석한 필드와 자체 미디어 메타를 **한 페이로드**로 **AIR 연동 접점**에 보내고, 접점이 **`call_id` 로드쉐어**로 적절한 AIR 인스턴스에 전달한다(gRPC·Kafka 등 **WT→GW 구간 JSON/바이너리 규약**). 미디어 미준비 구간은 `media` 생략 또는 `state`로 표현할 수 있다.
+
+```json
+{
+  "schema_version": "1.0",
+  "event_type": "call.context_and_media",
+  "occurred_at": "2026-05-07T12:34:56.801Z",
+  "call_id": "cm-7f3a9b2c-001",
+  "session_relay": {
+    "direction": "inbound",
+    "service_profile": "ai_voice_agent",
+    "dnis": "023331234",
+    "tenant_id": "tenant-01"
+  },
+  "leg_id": "wt-leg-a1",
+  "mirror": {
+    "stt_stream_key": "stt-stream-9x4k",
+    "codec": "pcm_s16le",
+    "sample_rate_hz": 16000,
+    "channels": 1
+  },
+  "tts": {
+    "inject_slot_id": "tts-slot-3"
+  }
+}
+```
+
+#### C. AI Runtime ↔ STT gRPC 스트림 첫 메타데이터 (개념 예시, JSON 등가)
+
+스트림 오픈 직후 한 번 보내는 헤더 프레임 개념이다.
+
+```json
+{
+  "call_id": "cm-7f3a9b2c-001",
+  "stt_stream_key": "stt-stream-9x4k",
+  "language": "ko-KR",
+  "partial_results": true
+}
+```
+
+#### D. AI Runtime → LLM OpenAI 호환 Chat Completion (요청 예시)
+
+```http
+POST /v1/chat/completions HTTP/1.1
+Host: llm-internal.example.com
+Authorization: Bearer ${SERVICE_TOKEN}
+Content-Type: application/json
+```
+
+```json
+{
+  "model": "qwen2.5-14b-instruct",
+  "stream": true,
+  "messages": [
+    { "role": "system", "content": "You are a call-center assistant. Reply in Korean." },
+    { "role": "user", "content": "예약 가능한 시간 알려줘." }
+  ]
+}
+```
+
+#### E. AI Runtime → TTS 스트리밍 합성 시작 (바디 예시)
+
+```json
+{
+  "voice_id": "ko-KR-female-01",
+  "text": "내일 오전 10시로 예약했습니다.",
+  "audio_format": "pcm_s16le",
+  "sample_rate_hz": 16000,
+  "call_id": "cm-7f3a9b2c-001"
+}
+```
+
+#### F. AI Runtime → WTIMS 재생 명령 (제어 API 예시)
+
+실제 전송은 사내 RPC·REST 중 선택; 페이로드 개념만 정리한다.
+
+```json
+{
+  "call_id": "cm-7f3a9b2c-001",
+  "inject_slot_id": "tts-slot-3",
+  "action": "enqueue_pcm",
+  "seq_base": 1000,
+  "total_frames_hint": 2400
+}
+```
+
+#### G. API/Realtime → AI Runtime 내부 조회 (REST 예시)
+
+```http
+GET /internal/v1/sessions/cm-7f3a9b2c-001/summary HTTP/1.1
+Host: api-realtime.internal
+X-Service-Auth: Bearer ${API_TOKEN}
+```
+
+#### H. 운영 콘솔 WebSocket 이벤트 (서버 → 브라우저)
+
+```json
+{
+  "type": "call.event",
+  "call_id": "cm-7f3a9b2c-001",
+  "payload": {
+    "state": "active",
+    "hitl_pending": false
+  }
+}
+```
+
+#### I. Qdrant 문서 업서트 (HTTP JSON 예시)
+
+```json
+{
+  "collection": "kb_prod",
+  "id": "doc-uuid-1234",
+  "embedding": [0.01, -0.02, 0.003],
+  "metadata": { "source": "faq", "tenant_id": "tenant-01" }
+}
+```
+
+임베딩 벡터는 차원에 맞는 실수 배열로 전송한다.
+
+#### J. 로컬 임시 파일 — API가 반환하는 업로드·처리 대상 (개념)
+
+**통화 녹음 원본은 WTIMS**가 담당한다. AI 계층에서는 노드 **로컬 디스크**에 임시·부산물을 두고, 필요 시 사내 REST가 스트림을 받아 **해당 인스턴스 로컬 경로에 쓰기**한다. 초기에는 **전용 공유 스토리지(NAS/Blob) 없음**(§7.3).
+
+```json
+{
+  "storage": "local_ephemeral",
+  "host_hint": "api-realtime-03",
+  "relative_path": "/var/lib/ai-call-agent/uploads/tenant-01/2026/05/import-batch.tgz",
+  "uri_internal": "https://api.internal/v1/files/upload?tenant_id=tenant-01",
+  "retention_policy": "purge_after_days_or_on_success"
+}
+```
 
