@@ -32,7 +32,7 @@ flowchart LR
 
     %% 연결 관계
     WT -->|RTP 스트림 직접 전달| STT
-    WT -->|통합 시그널 (호 세션 정보)| API_AIR
+    WT -->|"통합 시그널 (호 세션 정보)"| API_AIR
     API_AIR <-->|실시간 텍스트 수신| STT
     API_AIR <-->|텍스트 분석 요청| NLP_LLM
     
