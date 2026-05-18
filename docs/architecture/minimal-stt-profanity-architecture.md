@@ -253,11 +253,16 @@ flowchart TB
 
 ## 5. OPEX — 초기 SW 개발비 (운용비 제외)
 
-**본 절의 OPEX**는 통상 의미의 **월간 운용비가 아니라**, [prd.md](../product/prd.md) **§개발 공수(MM)** 에 대응하는 **초기 소프트웨어 개발비 ROM**이다. **전력·상면·유지보수·Cloud API 종량제** 등 **가동 후 운용비는 포함하지 않는다.**
+**본 절의 OPEX**는 **월간 운용비가 아닌** 초기 **소프트웨어 개발비 ROM**이다. **전력·상면·유지보수·Cloud API 종량제**는 포함하지 않는다.
 
-**단가(ROM):** [production-deployment-architecture.md](./production-deployment-architecture.md) **§11.4** — **약 1,300만 원/MM** (PRD KT AICC 견적 환산 단가와 동일).
+| 구분 | 산정 |
+|------|------|
+| **신규 AI Call Agent** | [prd.md](../product/prd.md) **§개발 공수(MM)** → **§5.1~5.2** |
+| **기존 노드 변경·연동** | 통화매니저 AS·WTIMS·유엔젤 API·바이토 API·PC Client 제품 측 개발 — **§5.3** (AI Call Agent **55 MM과 이중 계상 없음**) |
 
-**기존 코어 연동:** WTIMS·통화매니저 API(유엔젤/바이토) 등 **기존 노드 제품 개발**은 PRD **72 MM 합계와 이중 계상하지 않으며**, 상용 문서 **§11.3** 범주(**약 0.7억 원** + α)로 **별도** 산정한다.
+**단가(AI Call Agent MM 환산):** [production-deployment-architecture.md](./production-deployment-architecture.md) **§11.4** — **약 1,300만 원/MM**.
+
+**기존 노드 ROM** 은 상용 문서 **§11.3** 및 본 문서 연동 범위를 바탕으로 하며, **확정 견적이 없는 항목은 ROM(예상 범위)** 로 표기한다.
 
 ### 5.1 기능·서버·개발 공수 요약 (MM)
 
