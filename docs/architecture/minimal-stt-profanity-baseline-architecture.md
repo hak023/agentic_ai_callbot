@@ -105,13 +105,14 @@ sequenceDiagram
 
 ### 2.2 물리 구성
 
-신규 AI 측은 **물리 서버 3종·6대**(STT 2 + Runtime 2 + NLP·LLM 2). **본편 CAPEX·SW 합계**는 STT를 제외한 **2종·4대** 기준이다.
+신규 AI 측은 **AI 처리 서버** 영역 안에 **3종 서버**(AI Runtime · STT · NLP·LLM)로 구성한다. 물리적으로 **3종·6대**(각 2대 All-Active). **본편 CAPEX·SW 합계**는 STT를 제외한 **Runtime + NLP·LLM, 4대** 기준이다.
 
 | 구분 | 경로 | 설명 |
 |------|------|------|
 | **호 세션** | WTIMS → **AI Runtime** → **STT 서버** | 호 ID·발신번호·화자 매핑 |
 | **RTP** | WTIMS → **STT 서버** | 음성 스트림 직연 |
 | **전사** | STT 서버 → **AI Runtime** | interim/final → 자막·폭언 파이프라인 |
+| **폭언 판정** | AI Runtime → **NLP·LLM 서버** | 1차 NLP·2차 LLM **동일 호스트** 일체 |
 
 ```mermaid
 flowchart TB
@@ -120,17 +121,16 @@ flowchart TB
         CM --> WT[WTIMS]
     end
 
-    subgraph SRV_RT["AI Runtime 서버"]
-        RT[AI Runtime<br/>API · 세션 · 오케스트레이션]
-    end
-
-    subgraph SRV_STT["STT 서버 (별도 CAPEX·SW)"]
-        STT[STT 처리부]
-    end
-
-    subgraph SRV_ML["NLP·LLM 서버 (동일 호스트)"]
-        NLP[1차 NLP]
-        LLM[2차 LLM · 폭언 확정]
+    subgraph AI["AI 처리 서버"]
+        subgraph SRV_RT["AI Runtime 서버"]
+            RT[AI Runtime<br/>API · 세션 · 오케스트레이션]
+        end
+        subgraph SRV_STT["STT 서버 (별도 CAPEX·SW)"]
+            STT[STT 처리부]
+        end
+        subgraph SRV_ML["NLP·LLM 서버"]
+            ML[NLP·LLM<br/>1차 NLP · 2차 LLM 폭언 확정]
+        end
     end
 
     subgraph EXT["연동·단말 (기존)"]
@@ -143,8 +143,7 @@ flowchart TB
     RT -->|호 세션| STT
     WT -->|RTP| STT
     STT -->|전사| RT
-    RT --> NLP
-    RT --> LLM
+    RT --> ML
     RT <-->|폭언·자막| B
     B <--> U
     U -->|호 제어| CM
