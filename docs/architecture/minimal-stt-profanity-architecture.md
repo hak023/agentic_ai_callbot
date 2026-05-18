@@ -9,7 +9,7 @@
 | **목적** | 실시간 STT 기반 폭언·욕설 감지 → 바이토(수집) → 유엔젤 → 통화매니저 AS(호 종료 안내·호 종료) |
 | **신규** | AI Runtime, STT, NLP·LLM(동일 서버), PostgreSQL·VectorDB(동일 서버) |
 | **기존 활용** | 교환기, 통화매니저 AS, WTIMS, 유엔젤/바이토 API, PC Client |
-| **범위 외** | TTS, NL-IVR, Cloud STT/LLM API, 초기 개발비·운용비(OPEX) |
+| **범위 외** | TTS, NL-IVR, Cloud STT/LLM API, **가동 후 운용비**(전력·상면·유지보수·Cloud 종량제) |
 | **CAPEX·용량 근거** | [production-deployment-architecture.md](./production-deployment-architecture.md) (온프레미스·EMS 제외·TTS 제외로 축소) |
 
 동일 STT 인프라로 자막·TIP·스팸·CID 등 부가 기능을 제공할 수 있으나, 본 문서의 **아키텍처 중심**은 폭언·욕설 감지 경로이다.
@@ -193,7 +193,7 @@ flowchart TB
 
 ## 4. CAPEX (서버·HW, 온프레미스)
 
-**서버·HW 구매비(CAPEX)만** ROM으로 산정한다. 개발비·운용비·Cloud API 종량제는 **포함하지 않는다**.
+**서버·HW 구매비(CAPEX)만** ROM으로 산정한다. **초기 SW 개발비**는 **§5**를 본다.
 
 산정 근거: [production-deployment-architecture.md](./production-deployment-architecture.md) **§6.3(스펙)·§11.2(역할별 단가)**. 상용 16노드 구성에서 **TTS·AIR GW·API/Realtime(별도)·EMS** 를 제외하고, 본 문서의 **4종·8대** 배치(NLP·LLM 동거, PostgreSQL·Qdrant 동거, API는 AI Runtime에 통합)로 재매핑했다.
 
@@ -227,11 +227,61 @@ flowchart TB
 
 ---
 
+## 5. OPEX — 초기 SW 개발비 (운용비 제외)
+
+**본 절의 OPEX**는 통상 의미의 **월간 운용비가 아니라**, [prd.md](../product/prd.md) **§개발 공수(MM)** 에 대응하는 **초기 소프트웨어 개발비 ROM**이다. **전력·상면·유지보수·Cloud API 종량제** 등 **가동 후 운용비는 포함하지 않는다.**
+
+**단가(ROM):** [production-deployment-architecture.md](./production-deployment-architecture.md) **§11.4** — **약 1,300만 원/MM** (PRD KT AICC 견적 환산 단가와 동일).
+
+**기존 코어 연동:** WTIMS·통화매니저 API(유엔젤/바이토) 등 **기존 노드 제품 개발**은 PRD **72 MM 합계와 이중 계상하지 않으며**, 상용 문서 **§11.3** 범주(**약 0.7억 원** + α)로 **별도** 산정한다.
+
+### 5.1 서버별 개발 공수 (MM)
+
+PRD **v3.6 서버 역할 표(합계 72.0 MM)** 를 본 문서 **4종 서버·기능(§1)** 에 맞게 재배분했다. 제외·축소: **TTS**, **AIR GW**, **Pipecat 중심 NL-IVR**, **별도 API/Realtime 노드**(Runtime에 통합).
+
+| 본 문서 서버 | PRD 근거 (역할) | PRD MM | 본 문서 조정 | **MM** | 연관 기능 (§1) |
+|--------------|-----------------|--------|--------------|--------|----------------|
+| **AI Runtime** *(API·세션 통합)* | API/Realtime **5.0** + AI Runtime **22.0** | 27.0 | TTS·GW·음성 NL-IVR·Pipecat 풀스택 경로 축소 | **19.0** | #1~#6 (세션·자막·폭언 연동·TIP·스팸·CID API) |
+| **STT** | STT Server | 9.0 | — (온프레미스 ASR·RTP mirror·gRPC, 품질 검증 포함) | **9.0** | #1, #2 |
+| **NLP·LLM** *(동일 호스트)* | LLM Server | 11.0 | **1차 NLP**(폭언·욕설 규칙/경량 분류) 가산 | **12.0** | #1(1·2차 감지), #3, #4, #6 |
+| **DB** *(PostgreSQL·Qdrant 동거)* | PostgreSQL HA **2.5** + Qdrant **2.5** | 5.0 | 동일 호스트 배포만 변경, 스키마·벡터 범위 동일 | **5.0** | #1(감사), #3~#6 |
+| **공통·통합·검증** | 공통·통합·검증 | 12.0 | TTS·NL-IVR E2E 축소, **폭언·STT·바이토/유엔젤** 연동·부하 검증 유지 | **10.0** | 전 기능 |
+| **합계 (AI Call Agent SW)** | | **72.0** | | **55.0** | |
+
+### 5.2 초기 개발비 ROM
+
+| 항목 | MM | 단가 | 금액 (ROM) |
+|------|-----|------|------------|
+| AI Call Agent SW 개발 | **55.0** | 약 1,300만 원/MM | **약 7.15억 원** |
+| **기존 노드 연동 개발** *(별도, §11.3)* | — | — | **약 0.7억 원** |
+| **SW 개발 합계** | | | **약 7.85억 원** |
+
+> **참고:** 레포에 **이미 구현된 범위**가 크면 [prd.md](../product/prd.md) 가이드대로 MM·금액을 **잔여 구현 비율**로 재계산한다.
+
+### 5.3 PRD 대비 MM 제외·통합
+
+| PRD 서버(역할) | PRD MM | 본 문서 |
+|----------------|--------|---------|
+| TTS Server | 6.0 | **제외** (§3.1) |
+| AIR 연동 접점 GW | 2.0 | **제외** — WTIMS → AI Runtime 직연 |
+| API/Realtime | 5.0 | **AI Runtime에 통합** (19.0 MM 안에 포함) |
+| STT / LLM / PostgreSQL / Qdrant / 공통 | 9.0 / 11.0 / 2.5 / 2.5 / 12.0 | 위 표 **STT·NLP·LLM·DB·공통** 으로 재매핑 |
+
+### 5.4 CAPEX + 초기 개발비 요약
+
+| 구분 | ROM |
+|------|-----|
+| **CAPEX** (§4, 서버·HW 8대) | 약 **2.27억 원** (권장 범위 **1.8억 ~ 2.7억 원**) |
+| **초기 SW 개발** (§5, 55 MM + 연동 0.7억) | 약 **7.85억 원** |
+| **합계 (CAPEX + 초기 개발)** | 약 **10.1억 원** (CAPEX ±20%·잔여 MM 비율에 따라 변동) |
+
+---
+
 ## 부록
 
 ### A. 참고 문서
 
-[production-deployment-architecture.md](./production-deployment-architecture.md) · [prd.md](../product/prd.md) · [prd-detailed-phase1-4.md](../product/prd-detailed-phase1-4.md) · [CALL_HISTORY_AND_CONTENT_DESIGN.md](../design/CALL_HISTORY_AND_CONTENT_DESIGN.md)
+[production-deployment-architecture.md](./production-deployment-architecture.md) · [prd.md](../product/prd.md) (서버별 MM **v3.6**, 합계 72.0) · [prd-detailed-phase1-4.md](../product/prd-detailed-phase1-4.md) · [CALL_HISTORY_AND_CONTENT_DESIGN.md](../design/CALL_HISTORY_AND_CONTENT_DESIGN.md)
 
 ### B. 부가 기능 요약
 
