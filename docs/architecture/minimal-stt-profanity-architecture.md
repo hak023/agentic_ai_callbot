@@ -316,7 +316,7 @@ flowchart TB
 | **1차 NLP**·폭언·욕설 후보·규칙 엔진 | *(본편)* | #1 | NLP·LLM | **1.5** | PRD 서버 표에 없던 본편 가산 |
 | **2차 LLM**·폭언 확정·문맥·오탐 완화 | Epic **1.3** | #1 | NLP·LLM | **3.5** | RAG·추론 경로 일부 |
 | 폭언 **바이토 수집**·**유엔젤**·통화매니저 AS 연동 | *(본편)* | #1 | AI Runtime | **5.5** | 호 종료 안내·이벤트 |
-| 세션·오케스트레이션·WTIMS↔STT 시그널 | Epic **2.1** | #1, #2 | AI Runtime | **4.5** | NL-IVR·TTS·Pipecat **제외** |
+| 세션·오케스트레이션·WTIMS↔STT 시그널 | Epic **2.1** | #1, #2 | AI Runtime | **3.5** | NL-IVR·TTS·Pipecat **제외** |
 | VectorDB·임베딩·지식 저장 파이프라인 | Epic **1.2** | #3 | DB | **2.5** | Qdrant·PostgreSQL 동거 |
 | RAG·TIP·LLM 추론·출처 표시 | Epic **1.3** | #3 | NLP·LLM, AI Runtime | **3.0** | |
 | 지식 적재·문서·운영 UI | Phase **1** | #3 | DB, AI Runtime | **1.0** | |
@@ -338,7 +338,7 @@ flowchart TB
 | Phase | PRD MM | 본 문서 MM | 비고 |
 |-------|--------|------------|------|
 | Phase 1 (STT·Vector·RAG·지식) | 19.0 | **16.5** | 부재중 2.0 제외, 폭언·NLP 가산 반영 |
-| Phase 2 (Intent·Tool·운영 UI) | 20.5 | **13.5** | NL-IVR·Pipecat 대부분 제외 |
+| Phase 2 (Intent·Tool·운영 UI) | 20.5 | **12.5** | NL-IVR·Pipecat 대부분 제외 |
 | Phase 3 (HITL·리뷰·Shadowing) | 10.5 | **2.5** | Shadowing 제외, HITL 최소 |
 | Phase 4 (Agent) | 8.5 | **0** | 제외 |
 | Cross-cutting | 13.5 | **10.0** | |
