@@ -9,7 +9,8 @@
 | **목적** | 실시간 STT 기반 폭언·욕설 감지 → 바이토(수집) → 유엔젤 → 통화매니저 AS(호 종료 안내·호 종료) |
 | **신규** | AI Runtime, STT, NLP·LLM(동일 서버), PostgreSQL·VectorDB(동일 서버) |
 | **기존 활용** | 교환기, 통화매니저 AS, WTIMS, 유엔젤/바이토 API, PC Client |
-| **범위 외** | AI Call Agent TTS, NL-IVR, 초기 개발비·운용비(OPEX) |
+| **범위 외** | TTS, NL-IVR, Cloud STT/LLM API, 초기 개발비·운용비(OPEX) |
+| **CAPEX·용량 근거** | [production-deployment-architecture.md](./production-deployment-architecture.md) (온프레미스·EMS 제외·TTS 제외로 축소) |
 
 동일 STT 인프라로 자막·TIP·스팸·CID 등 부가 기능을 제공할 수 있으나, 본 문서의 **아키텍처 중심**은 폭언·욕설 감지 경로이다.
 
@@ -162,7 +163,7 @@ flowchart TB
 1. **폭언 감지 우선** — STT·1차 NLP·2차 LLM·외부 연동(P-1)을 최우선 경로로 설계한다.
 2. **시그널·미디어 분리** — **호 세션**은 WTIMS → AI Runtime → STT, **RTP**는 WTIMS → STT 직연.
 3. **역할별 서버 배치** — AI Runtime(세션·API), STT(음성·전사), **NLP·LLM 동일 서버**, **PostgreSQL·VectorDB 동일 서버**.
-4. **STT 선택 가능** — 자체 GPU STT 또는 Cloud STT(옵션 A/B, §4).
+4. **온프레미스 전용** — STT·LLM 모두 자체 GPU 서버에 구축(Cloud API 미사용).
 5. **코어 비침해** — 교환기·통화매니저 AS·WTIMS 구조는 유지하고, AI는 세션·RTP 미러·API 연동으로만 접근한다.
 
 ---
@@ -171,40 +172,58 @@ flowchart TB
 
 신규·추가되는 AI 측 구성만 기술한다. 코어·API·단말은 기존 자산이다.
 
-| 노드 | 배치 | 기능 | 연관 §1 |
-|------|------|------|---------|
-| **AI Runtime 서버** | 신규 1대(± HA) | WTIMS 호 세션 수신, STT 세션 연계, 전사 수신·오케스트레이션, 바이토/유엔젤 연동 | #1~#6 |
-| **STT 서버** | 신규 1대(GPU) | WTIMS **RTP 직연**, Runtime **호 세션** 수신, interim/final 전사 | #1, #2 |
-| **NLP·LLM** | **동일 서버** 1대 | 1차 NLP(후보)·2차 LLM(확정·요약·TIP·스팸·CID) | #1, #3, #4, #6 |
-| **PostgreSQL·VectorDB** | **동일 서버** 1대 | 이력·폭언 감사·스팸·연락처 / 지식 임베딩·TIP 검색 | #1, #3, #4~#6 |
+| 서버 종류 | 구성 대수 | 이중화 | 기능 | 연관 §1 |
+|-----------|-----------|--------|------|---------|
+| **AI Runtime** *(API·세션 통합)* | **2** | All-Active | WTIMS 호 세션, STT 세션 연계, 전사·폭언 오케스트레이션, 바이토/유엔젤 | #1~#6 |
+| **STT** | **2** | All-Active | WTIMS RTP 직연·호 세션, interim/final 전사 | #1, #2 |
+| **NLP·LLM** *(동일 호스트)* | **2** | All-Active | 1차 NLP·2차 LLM(확정·요약·TIP·스팸·CID) | #1, #3, #4, #6 |
+| **DB** *(PostgreSQL·VectorDB 동거)* | **2** | Primary + Standby | 이력·폭언 감사·스팸·연락처 / 지식·TIP 벡터 검색 | #1, #3, #4~#6 |
 
-### 3.1 배포 옵션
+**합계: 신규 물리 서버 8대** (교환기·통화매니저 AS·WTIMS·EMS·TTS 제외). 용량 목표는 참조 문서와 동일하게 **동시 통화 약 500호·시간당 15,000명** 부하를 전제한다(병목: AI Runtime 동시 세션).
 
-| 옵션 | 구성 | 특성 |
-|------|------|------|
-| **A** | Runtime 1 + STT(GPU) 1 + NLP·LLM 1 + DB 1 | 망 내 STT·LLM, CAPEX ↑ |
-| **B** | Runtime 1 + DB 1 (STT·LLM Cloud API) | STT·LLM **OPEX 별도**, CAPEX ↓ |
-
-### 3.2 도입하지 않는 노드
+### 3.1 도입하지 않는 노드
 
 | 항목 | 사유 |
 |------|------|
-| AIR GW | API·Runtime 통합으로 불필요 |
-| AI Call Agent TTS | 호 안내는 통화매니저 AS; NL-IVR 제외 |
+| TTS | 호 종료 안내는 통화매니저 AS; NL-IVR 제외 |
+| AIR GW | WTIMS → AI Runtime 직연(본 설계); 별도 GW 미도입 |
+| Cloud STT/LLM | 온프레미스 자체 구축만 |
 
 ---
 
-## 4. CAPEX (서버·HW)
+## 4. CAPEX (서버·HW, 온프레미스)
 
-서버·HW 구매비만 ROM으로 산정한다. 개발비·운용비·Cloud API 종량제는 포함하지 않는다.
+**서버·HW 구매비(CAPEX)만** ROM으로 산정한다. 개발비·운용비·Cloud API 종량제는 **포함하지 않는다**.
 
-| 항목 | 옵션 A | 옵션 B |
-|------|--------|--------|
-| AI Runtime 서버 | CPU 8~16C, RAM 32~64GB | 동일 |
-| STT 서버 (GPU) | 1대 (A10/L4급) | Cloud STT 시 **0대** |
-| NLP·LLM 서버 | CPU/GPU 1대 (NLP·LLM 동거) | LLM Cloud 시 CPU 위주 |
-| DB 서버 (PostgreSQL·VectorDB 동거) | CPU 8C, RAM 32~64GB, NVMe SSD | 동일 |
-| **합계 (ROM)** | **약 1.1억 ~ 1.7억 원** | **약 0.35억 ~ 0.55억 원** |
+산정 근거: [production-deployment-architecture.md](./production-deployment-architecture.md) **§6.3(스펙)·§11.2(역할별 단가)**. 상용 16노드 구성에서 **TTS·AIR GW·API/Realtime(별도)·EMS** 를 제외하고, 본 문서의 **4종·8대** 배치(NLP·LLM 동거, PostgreSQL·Qdrant 동거, API는 AI Runtime에 통합)로 재매핑했다.
+
+### 4.1 서버 종류별 구성 대수
+
+| 서버 종류 | 구성 대수 | 이중화 | 권장 스펙(노드당, 요약) | 노드당 ROM | 합계 ROM |
+|-----------|-----------|--------|-------------------------|------------|----------|
+| **AI Runtime** *(API·세션 통합)* | **2** | All-Active | 16 vCPU, 64 GB RAM, HDD 1 TB, 1 Gbps | 약 1,042만 원 | **약 2,084만 원** |
+| **STT** | **2** | All-Active | 32 vCPU, 128 GB RAM, **L40S×1**, HDD 2 TB, 10 Gbps | 약 2,995만 원 | **약 5,990만 원** |
+| **NLP·LLM** *(동일 호스트)* | **2** | All-Active | 32 vCPU, 256 GB RAM, **L40S×2**, HDD 2 TB, 1 Gbps | 약 5,378만 원 | **약 1억 756만 원** |
+| **DB** *(PostgreSQL·Qdrant 동거)* | **2** | Primary + Standby | 24 vCPU, 128 GB RAM, HDD 4 TB, 1 Gbps | 약 1,950만 원 | **약 3,900만 원** |
+| **합계** | **8대** | — | — | — | **약 2억 2,730만 원** |
+
+> **DB 노드당 ROM**: 참조 문서 PostgreSQL HA(약 1,662만)와 Qdrant(약 1,090만)를 **동일 호스트**로 합산·소폭 절감한 ROM(스펙은 PostgreSQL HA 기준, VectorDB 워크로드 동거).
+
+### 4.2 구매 범위(ROM)
+
+| 항목 | 금액 |
+|------|------|
+| **CAPEX 합계(표 기준)** | **약 2.27억 원** |
+| **권장 구매 범위** | **약 1.8억 ~ 2.7억 원** (부품·리셀러 조건 ±20%, 참조 문서 §11.2와 동일) |
+
+### 4.3 참조 문서 대비 제외·통합
+
+| 참조 문서(16노드) | 본 문서(8대) |
+|-------------------|--------------|
+| TTS 2대 | **제외** (통화매니저 AS 안내) |
+| AIR GW 1+1 | **제외** (WTIMS → AI Runtime 직연) |
+| API/Realtime 1+1 | **AI Runtime에 통합** (2대 All-Active) |
+| STT 2, LLM 2, AI Runtime 2, PG 2, Qdrant 2 | STT 2 · **NLP·LLM 2(동거)** · Runtime 2 · **DB 2(PG·Vector 동거)** |
 
 ---
 
@@ -212,7 +231,7 @@ flowchart TB
 
 ### A. 참고 문서
 
-[prd.md](../product/prd.md) · [prd-detailed-phase1-4.md](../product/prd-detailed-phase1-4.md) · [CALL_HISTORY_AND_CONTENT_DESIGN.md](../design/CALL_HISTORY_AND_CONTENT_DESIGN.md) · [CDR_ENHANCEMENT_DESIGN.md](../design/CDR_ENHANCEMENT_DESIGN.md)
+[production-deployment-architecture.md](./production-deployment-architecture.md) · [prd.md](../product/prd.md) · [prd-detailed-phase1-4.md](../product/prd-detailed-phase1-4.md) · [CALL_HISTORY_AND_CONTENT_DESIGN.md](../design/CALL_HISTORY_AND_CONTENT_DESIGN.md)
 
 ### B. 부가 기능 요약
 
